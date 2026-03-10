@@ -1,112 +1,64 @@
 ---
 name: autoresearch-create
-description: Create a new autoresearch skill for any optimization target. Generates a domain-specific SKILL.md that drives the autoresearch extension's experiment loop. Use when asked to "create an autoresearch skill", "set up autoresearch for X", or "make a new experiment loop".
+description: Set up and run an autonomous experiment loop for any optimization target. Gathers what to optimize, then starts the loop immediately. Use when asked to "run autoresearch", "optimize X in a loop", "set up autoresearch for X", or "start experiments".
 ---
 
-# Create an Autoresearch Skill
+# Autoresearch — Setup & Run
 
-Generate a domain-specific skill that drives the autoresearch extension (`run_experiment` + `log_experiment` tools, widget, `/autoresearch` dashboard).
-
-## Gather Inputs
-
-Ask the user for these (propose smart defaults from context):
-
-1. **Name** — kebab-case skill name, e.g. `autoresearch-vitest-speed`
-2. **Goal** — one sentence: what are we optimizing?
-3. **Metric** — what number do we measure? (e.g. wall-clock seconds, val_bpb, bundle size KB)
-4. **Direction** — lower is better or higher is better?
-5. **Command** — the shell command to run per experiment (e.g. `pnpm test:vitest`, `uv run train.py`)
-6. **Files in scope** — what can the agent modify?
-7. **Files read-only** — what must NOT be modified?
-8. **Constraints** — hard rules (e.g. "all tests must pass", "don't delete files")
-9. **Ideas** — 5-10 things to try, roughly ordered by expected impact
-10. **Working directory** — where to run from
-
-## Generate the Skill
-
-Create the skill at `~/.pi/agent-shopify/skills/<name>/SKILL.md` following this template:
-
-```markdown
----
-name: {{name}}
-description: {{one-line description including trigger phrases}}
----
-
-# autoresearch — {{Goal}}
-
-Autonomous experiment loop to {{goal description}}.
+Set up an autonomous experiment loop and start running immediately.
 
 ## Tools
 
-You have two custom tools from the autoresearch extension. **Always use these instead of raw bash:**
+You have two custom tools from the autoresearch extension. **Always use these instead of raw bash for experiments:**
 
-- **`run_experiment`** — pass it a `command` to run. It times execution, captures output, detects pass/fail. Returns structured results.
-- **`log_experiment`** — records each experiment's `commit`, `metric` ({{metric unit}}), `status` (keep/discard/crash), and `description`. Persists state, updates widget and dashboard.
+- **`run_experiment`** — pass it a `command` to run. It times execution, captures output, detects pass/fail via exit code.
+- **`log_experiment`** — records each experiment's `commit`, `metric`, `status` (keep/discard/crash), and `description`. Persists state, updates the status widget and `/autoresearch` dashboard.
 
-The user can view all results anytime with `/autoresearch`.
+## Step 1: Gather Context
 
-## Setup
+Ask the user (propose smart defaults based on the codebase):
 
-1. **Agree on a run tag** with the user (e.g. `{{example-tag}}`).
-2. **Create a branch**: `git checkout -b autoresearch/<tag>` from HEAD.
-3. **Read the codebase** to understand what you're working with:
-   {{list of files to read with brief descriptions}}
-4. **Confirm and go.**
+1. **Goal** — what are we optimizing? (e.g. "reduce vitest execution time")
+2. **Command** — shell command to run per experiment (e.g. `pnpm test:vitest`)
+3. **Metric** — what number to measure, and is lower or higher better?
+4. **Files in scope** — what can you modify?
+5. **Constraints** — hard rules (e.g. "all tests must pass", "don't delete files")
 
-## The Metric
+If the user already provided these in their prompt, skip asking and confirm your understanding.
 
-**{{Metric name}}** — {{direction}} is better.
+## Step 2: Setup
 
-## Constraints
+1. **Create a branch**: `git checkout -b autoresearch/<tag>` (propose a tag based on the goal + date).
+2. **Read the relevant files** to understand what you're working with.
+3. **Run the baseline**: use `run_experiment` with the command as-is, then `log_experiment` to record it.
+4. **Start looping** — do NOT wait for confirmation after the baseline. Go.
 
-{{bullet list of hard constraints}}
-
-## What's In Scope
-
-You CAN modify:
-{{bullet list of editable files/patterns}}
-
-You CANNOT modify:
-{{bullet list of read-only files/patterns}}
-
-## What to Try
-
-Ideas roughly ordered by expected impact:
-
-{{numbered list of 5-10 experiment ideas with brief rationale}}
-
-## The Experiment Loop
+## Step 3: Experiment Loop
 
 LOOP FOREVER:
 
-1. Edit files with an experimental idea
-2. `GIT_EDITOR=true git add -A && git commit -m "description"`
-3. Use `run_experiment` with command `{{command}}`
-4. Use `log_experiment` to record the result
-5. If {{metric}} improved → keep (status: `keep`)
-6. If {{metric}} worse OR broken → revert with `git reset --hard HEAD~1` (status: `discard` or `crash`)
-7. Repeat
+1. Think of an experiment idea. Read the codebase for inspiration. Consider:
+   - Config changes (parallelism, caching, pooling, environment)
+   - Removing unnecessary work (unused setup, redundant transforms)
+   - Structural changes (splitting, merging, reordering)
+2. Edit files with the idea
+3. `GIT_EDITOR=true git add -A && git commit -m "short description"`
+4. Use `run_experiment` with the command
+5. Use `log_experiment` to record the result
+6. If metric improved AND constraints met → keep (status: `keep`)
+7. If metric worse OR constraints broken → `git reset --hard HEAD~1` (status: `discard` or `crash`)
+8. Repeat
 
-**NEVER STOP.** Loop indefinitely. Do not ask for permission to continue.
+**Simplicity criterion**: all else being equal, simpler is better. Removing code for equal results is a win.
 
-**Crashes**: If it's a trivial fix, fix and retry. If fundamentally broken, discard and move on.
-```
+**NEVER STOP.** Loop indefinitely until the user interrupts. Do not ask "should I continue?". The user can check progress anytime with `/autoresearch`.
 
-## After Generating
+**Crashes**: if it's a trivial fix (typo, missing import), fix and retry. If fundamentally broken, discard and move on.
 
-1. Write the file to `~/.pi/agent-shopify/skills/<name>/SKILL.md`
-2. Tell the user to `/reload` to pick it up
-3. Tell the user they can now run it with `/skill:{{name}}`
-4. Show a preview of the generated skill
+## Example Domains
 
-## Examples of Good Skills
-
-**Test speed**: metric=seconds, direction=lower, command=`pnpm test`, scope=vitest configs, constraint=all tests must pass
-
-**Bundle size**: metric=KB, direction=lower, command=`pnpm build && du -sb dist`, scope=webpack/vite config + imports, constraint=app must still work
-
-**LLM training**: metric=val_bpb, direction=lower, command=`uv run train.py`, scope=train.py only, constraint=5-min time budget
-
-**Build speed**: metric=seconds, direction=lower, command=`pnpm build`, scope=tsconfig + bundler config, constraint=output must be identical
-
-**Lighthouse score**: metric=performance score, direction=higher, command=`lighthouse http://localhost:3000 --output=json`, scope=components + loading strategy, constraint=no feature removal
+- **Test speed**: metric=seconds ↓, command=`pnpm test`, scope=vitest/jest configs
+- **Bundle size**: metric=KB ↓, command=`pnpm build && du -sb dist`, scope=bundler config
+- **Build speed**: metric=seconds ↓, command=`pnpm build`, scope=tsconfig + bundler
+- **LLM training**: metric=val_bpb ↓, command=`uv run train.py`, scope=train.py
+- **Lighthouse score**: metric=perf score ↑, command=`lighthouse --output=json`, scope=components
