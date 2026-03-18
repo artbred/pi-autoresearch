@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
+
+NOTEBOOK_SRC="${NOTEBOOK_SRC:-notebook.py}"
+NOTEBOOK_IPYNB="${NOTEBOOK_IPYNB:-notebook.ipynb}"
+SUBMISSION_FILE="${SUBMISSION_FILE:-outputs/__SUBMISSION_FILENAME__}"
+KERNEL_METADATA_FILE="${KERNEL_METADATA_FILE:-kernel-metadata.json}"
+REQUIRED_COLUMNS="${REQUIRED_COLUMNS:-__ID_COLUMN__,__TARGET_COLUMN__}"
+ALLOW_GPU="${ALLOW_GPU:-false}"
+ALLOW_INTERNET="${ALLOW_INTERNET:-false}"
+ALLOWED_DATASET_SOURCES="${ALLOWED_DATASET_SOURCES:-}"
+FORBIDDEN_PATTERNS="${FORBIDDEN_PATTERNS:-}"
+
+python3 build_notebook.py --input "$NOTEBOOK_SRC" --output "$NOTEBOOK_IPYNB" >/dev/null
+
+if [[ ! -f "$SUBMISSION_FILE" ]]; then
+  echo "Missing submission file: $SUBMISSION_FILE"
+  exit 1
+fi
+
+python3 - "$SUBMISSION_FILE" "$REQUIRED_COLUMNS" <<'PY'
+import csv
+import sys
+from pathlib import Path
+
+submission_path = Path(sys.argv[1])
+required = [column for column in sys.argv[2].split(",") if column]
+
+with submission_path.open(newline="") as handle:
+    reader = csv.DictReader(handle)
+    if reader.fieldnames is None:
+        raise SystemExit("Submission file is missing a header row.")
+    missing = [column for column in required if column not in reader.fieldnames]
+    if missing:
+        raise SystemExit(f"Submission file is missing required columns: {', '.join(missing)}")
+    first_row = next(reader, None)
+    if first_row is None:
+        raise SystemExit("Submission file has no prediction rows.")
+PY
+
+python3 - "$KERNEL_METADATA_FILE" "$ALLOW_GPU" "$ALLOW_INTERNET" "$ALLOWED_DATASET_SOURCES" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+metadata_path = Path(sys.argv[1])
+allow_gpu = sys.argv[2].lower() == "true"
+allow_internet = sys.argv[3].lower() == "true"
+allowlist = {item for item in sys.argv[4].split(",") if item}
+
+if not metadata_path.exists():
+    raise SystemExit(f"Missing kernel metadata file: {metadata_path}")
+
+metadata = json.loads(metadata_path.read_text())
+
+if metadata.get("enable_gpu") and not allow_gpu:
+    raise SystemExit("GPU is enabled in kernel-metadata.json but the session forbids GPU.")
+
+if metadata.get("enable_internet") and not allow_internet:
+    raise SystemExit("Internet is enabled in kernel-metadata.json but the session forbids internet.")
+
+dataset_sources = metadata.get("dataset_sources") or []
+if allowlist and any(source not in allowlist for source in dataset_sources):
+    raise SystemExit(
+        "kernel-metadata.json references dataset sources outside the allowlist: "
+        + ", ".join(sorted(set(dataset_sources) - allowlist))
+    )
+PY
+
+if [[ -n "$FORBIDDEN_PATTERNS" ]]; then
+  IFS=',' read -r -a patterns <<< "$FORBIDDEN_PATTERNS"
+  for pattern in "${patterns[@]}"; do
+    [[ -z "$pattern" ]] && continue
+    if command -v rg >/dev/null 2>&1; then
+      if rg -n --fixed-strings "$pattern" "$NOTEBOOK_SRC" "$KERNEL_METADATA_FILE" >/dev/null 2>&1; then
+        echo "Forbidden pattern found: $pattern"
+        exit 1
+      fi
+    else
+      if grep -R -n -F "$pattern" "$NOTEBOOK_SRC" "$KERNEL_METADATA_FILE" >/dev/null 2>&1; then
+        echo "Forbidden pattern found: $pattern"
+        exit 1
+      fi
+    fi
+  done
+fi
+
+echo "Checks passed"

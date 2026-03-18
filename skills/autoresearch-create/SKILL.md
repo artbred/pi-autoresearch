@@ -56,7 +56,7 @@ Update `autoresearch.md` periodically — especially the "What's Been Tried" sec
 
 ### `autoresearch.sh`
 
-Bash script (`set -euo pipefail`) that: pre-checks fast (syntax errors in <1s), runs the benchmark, outputs `METRIC name=number` lines. Keep it fast — every second is multiplied by hundreds of runs. Update it during the loop as needed.
+Bash script (`set -euo pipefail`) that: pre-checks fast (syntax errors in <1s), runs the experiment workload, outputs `METRIC name=number` lines. Keep it fast — every second is multiplied by hundreds of runs. Update it during the loop as needed.
 
 ### `autoresearch.config.json` (optional)
 
@@ -77,7 +77,7 @@ JSON config file that lives in the pi session's working directory (`ctx.cwd`). S
 Bash script (`set -euo pipefail`) for backpressure/correctness checks: tests, types, lint, etc. **Only create this file when the user's constraints require correctness validation** (e.g., "tests must pass", "types must check").
 
 When this file exists:
-- Runs automatically after every **passing** benchmark in `run_experiment`.
+- Runs automatically after every **passing** experiment command in `run_experiment`.
 - If checks fail, `run_experiment` reports it clearly — log as `checks_failed`.
 - Its execution time does **NOT** affect the primary metric.
 - You cannot `keep` a result when checks have failed.

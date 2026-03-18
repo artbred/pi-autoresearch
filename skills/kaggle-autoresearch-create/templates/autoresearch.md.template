@@ -1,0 +1,107 @@
+# Autoresearch: __COMPETITION_TITLE__ first-place chase
+
+## Objective
+Win the Kaggle competition `__COMPETITION_SLUG__` by iterating on notebook submissions, mining strong public ideas, and improving public leaderboard position without violating the rules.
+
+## Competition Summary
+- Competition: __COMPETITION_TITLE__
+- URL: __COMPETITION_URL__
+- Slug: __COMPETITION_SLUG__
+- Evaluation metric: __EVALUATION_METRIC__
+- Deadline: __DEADLINE__
+- Resource flags: __RESOURCE_FLAGS__
+
+## Metrics
+- Primary: `public_rank` (position, lower is better)
+- Secondary: `public_score` (__PUBLIC_SCORE_DIRECTION__ is better), `cv_score` (`__CV_METRIC_NAME__`, __CV_DIRECTION__ is better), `submission_count` (count)
+
+## Keep / Discard Policy
+- Keep when `public_rank` improves.
+- If `public_rank` is unchanged, keep only when `public_score` improves.
+- Otherwise discard.
+- Use `--local-only` to decide whether a candidate is worth a real submission, but do not invent leaderboard gains from local CV alone.
+- When the daily submission cap is exhausted, switch to provisional local mode:
+  - keep candidates that materially improve `cv_score` or robustness
+  - mark them as pending leaderboard validation
+  - queue the strongest notebook for the next submission window
+
+## How to Run
+- `./autoresearch.sh --local-only`
+- `./autoresearch.sh --submit`
+
+## Files in Scope
+- `notebook.py` — editable Kaggle notebook source of truth.
+- `notebook.ipynb` — generated upload artifact.
+- `build_notebook.py` — renders `notebook.py` into notebook JSON.
+- `kernel-metadata.json` — Kaggle kernel packaging and resource flags.
+- `__SUBMISSION_ARTIFACT__` — submission file produced by the local or Kaggle run.
+- __FILES_IN_SCOPE__
+
+## Off Limits
+- __OFF_LIMITS__
+- Any leaked labels or evaluation target leakage.
+- Any dataset, model, or notebook disallowed by the competition rules.
+- Private sharing or collaboration patterns the competition forbids.
+
+## Constraints
+- __CONSTRAINTS__
+- Stay inside the written Kaggle rules at all times.
+- Do not spend submissions carelessly; preserve quota for high-confidence candidates.
+
+## Rules / Leakage Bans
+- Allowed external datasets: __ALLOWED_DATASETS__
+- Forbidden datasets or patterns: __FORBIDDEN_PATTERNS__
+- Notes from the rules page: __RULE_NOTES__
+
+## Submission Budget
+- Daily submission cap: __SUBMISSION_CAP__
+- Operating policy: use `--local-only` for triage, reserve `--submit` for notebook variants with a real CV or robustness story.
+- Current reserve policy: __SUBMISSION_POLICY__
+- When the cap is reached, do not stop the loop. Continue local iterations, write the strongest candidates to the pending submission queue, and resume leaderboard validation when the window reopens.
+- Local accelerator strategy: detect CUDA / ROCm / MPS and use GPU-backed runs whenever the machine supports them.
+
+## Local Validation Strategy
+- Validation metric: `__CV_METRIC_NAME__`
+- Direction: __CV_DIRECTION__
+- Folds / split strategy: __VALIDATION_STRATEGY__
+- Leakage controls: __LEAKAGE_CONTROLS__
+- Tie-breakers: prefer robustness over noisy CV spikes.
+
+## Discussion Mining
+- High-signal discussions:
+  - __DISCUSSION_1__
+  - __DISCUSSION_2__
+  - __DISCUSSION_3__
+- Public notebook ideas to test:
+  - __NOTEBOOK_IDEA_1__
+  - __NOTEBOOK_IDEA_2__
+  - __NOTEBOOK_IDEA_3__
+
+## Allowed External Datasets
+- __DATASET_1__
+- __DATASET_2__
+- __DATASET_3__
+
+## Leaderboard History
+| Iteration | Public Rank | Public Score | CV Score | Notes |
+|---|---:|---:|---:|---|
+| baseline | __BASELINE_PUBLIC_RANK__ | __BASELINE_PUBLIC_SCORE__ | __BASELINE_CV_SCORE__ | __BASELINE_NOTES__ |
+
+## Pending Submission Queue
+- Track the best local-only candidates here whenever the daily submission cap is exhausted.
+- Note the notebook variant, `cv_score`, robustness story, and why it should be first in line once submissions reopen.
+
+## What's Been Tried
+- __TRIED_1__
+- __TRIED_2__
+- __TRIED_3__
+
+## Current Hypotheses
+- __HYPOTHESIS_1__
+- __HYPOTHESIS_2__
+- __HYPOTHESIS_3__
+
+## Next Candidate Notebooks
+- __NEXT_NOTEBOOK_1__
+- __NEXT_NOTEBOOK_2__
+- __NEXT_NOTEBOOK_3__

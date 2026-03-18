@@ -615,8 +615,8 @@ function renderDashboardLines(
 
 export default function autoresearchExtension(pi: ExtensionAPI) {
   const MAX_AUTORESUME_TURNS = 20;
-  const BENCHMARK_GUARDRAIL =
-    "Be careful not to overfit to the benchmarks and do not cheat on the benchmarks.";
+  const EVALUATION_GUARDRAIL =
+    "Be careful not to overfit to the evaluation loop and do not game the metric.";
 
   const runtimeStore = createRuntimeStore();
   const getSessionKey = (ctx: ExtensionContext) => ctx.sessionManager.getSessionId();
@@ -655,6 +655,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Examples:",
       "  /autoresearch optimize unit test runtime, monitor correctness",
       "  /autoresearch model training, run 5 minutes of train.py and note the loss ratio as optimization target",
+      "  /autoresearch chase first place in titanic, mine discussions, and iterate on notebook submissions",
     ].join("\n");
 
   // -----------------------------------------------------------------------
@@ -953,7 +954,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     if (hasIdeas) {
       resumeMsg += " Check autoresearch.ideas.md for promising paths to explore. Prune stale/tried ideas.";
     }
-    resumeMsg += ` ${BENCHMARK_GUARDRAIL}`;
+    resumeMsg += ` ${EVALUATION_GUARDRAIL}`;
 
     runtime.autoResumeTurns++;
     pi.sendUserMessage(resumeMsg);
@@ -979,14 +980,14 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\nUse init_experiment, run_experiment, and log_experiment tools. NEVER STOP until interrupted." +
       `\nExperiment rules: ${mdPath} — read this file at the start of every session and after compaction.` +
       "\nWrite promising but deferred optimizations as bullet points to autoresearch.ideas.md — don't let good ideas get lost." +
-      `\n${BENCHMARK_GUARDRAIL}` +
+      `\n${EVALUATION_GUARDRAIL}` +
       "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration.";
 
     if (hasChecks) {
       extra +=
         "\n\n## Backpressure Checks (ACTIVE)" +
-        `\n${checksPath} exists and runs automatically after every passing benchmark in run_experiment.` +
-        "\nIf the benchmark passes but checks fail, run_experiment will report it clearly." +
+        `\n${checksPath} exists and runs automatically after every passing experiment command in run_experiment.` +
+        "\nIf the experiment command passes but checks fail, run_experiment will report it clearly." +
         "\nUse status 'checks_failed' in log_experiment when this happens — it behaves like a crash (no commit, changes auto-reverted)." +
         "\nYou cannot use status 'keep' when checks have failed." +
         "\nThe checks execution time does NOT affect the primary metric.";
@@ -1015,7 +1016,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Call init_experiment exactly once at the start of an autoresearch session, before the first run_experiment.",
       "If autoresearch.jsonl already exists with a config, do NOT call init_experiment again.",
-      "If the optimization target changes (different benchmark, metric, or workload), call init_experiment again to insert a new config header and reset the baseline.",
+      "If the optimization target changes (different experiment workflow, metric, or workload), call init_experiment again to insert a new config header and reset the baseline.",
     ],
     parameters: InitParams,
 
@@ -1227,13 +1228,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       } else if (!benchmarkPassed) {
         text += `💥 FAILED (exit code ${result.code}) in ${durationSeconds.toFixed(1)}s\n`;
       } else if (checksTimedOut) {
-        text += `✅ Benchmark PASSED in ${durationSeconds.toFixed(1)}s\n`;
+        text += `✅ Experiment PASSED in ${durationSeconds.toFixed(1)}s\n`;
         text += `⏰ CHECKS TIMEOUT (autoresearch.checks.sh) after ${checksDuration.toFixed(1)}s\n`;
-        text += `Log this as 'checks_failed' — the benchmark metric is valid but checks timed out.\n`;
+        text += `Log this as 'checks_failed' — the primary metric is valid but checks timed out.\n`;
       } else if (checksPass === false) {
-        text += `✅ Benchmark PASSED in ${durationSeconds.toFixed(1)}s\n`;
+        text += `✅ Experiment PASSED in ${durationSeconds.toFixed(1)}s\n`;
         text += `💥 CHECKS FAILED (autoresearch.checks.sh) in ${checksDuration.toFixed(1)}s\n`;
-        text += `Log this as 'checks_failed' — the benchmark metric is valid but correctness checks did not pass.\n`;
+        text += `Log this as 'checks_failed' — the primary metric is valid but correctness checks did not pass.\n`;
       } else {
         text += `✅ PASSED in ${durationSeconds.toFixed(1)}s\n`;
         if (checksPass === true) {
@@ -1356,7 +1357,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Always call log_experiment after run_experiment to record the result.",
       "log_experiment automatically runs git add -A && git commit on 'keep', and auto-reverts code changes on 'discard'/'crash'/'checks_failed' (autoresearch files are preserved). Do NOT commit or revert manually.",
-      "Use status 'keep' if the PRIMARY metric improved. 'discard' if worse or unchanged. 'crash' if it failed. Secondary metrics are for monitoring — they almost never affect keep/discard. Only discard a primary improvement if a secondary metric degraded catastrophically, and explain why in the description.",
+      "Use status 'keep' if the PRIMARY metric improved. 'discard' if worse or unchanged. 'crash' if it failed. If the primary metric is tied, an explicitly chosen secondary tie-breaker may decide keep/discard; explain that in the description.",
       "If you discover complex but promising optimizations you won't pursue immediately, append them as bullet points to autoresearch.ideas.md. Don't let good ideas get lost.",
     ],
     parameters: LogParams,
@@ -1381,7 +1382,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return {
           content: [{
             type: "text",
-            text: `❌ Cannot keep — autoresearch.checks.sh failed.\n\n${runtime.lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead. The benchmark metric is valid but correctness checks did not pass.`,
+            text: `❌ Cannot keep — autoresearch.checks.sh failed.\n\n${runtime.lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead. The primary metric is valid but correctness checks did not pass.`,
           }],
           details: {},
         };
@@ -1876,11 +1877,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       if (hasRules) {
         ctx.ui.notify("Autoresearch mode ON — rules loaded from autoresearch.md", "info");
-        pi.sendUserMessage(`Autoresearch mode active. ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`);
+        pi.sendUserMessage(`Autoresearch mode active. ${trimmedArgs} ${EVALUATION_GUARDRAIL}`);
       } else {
         ctx.ui.notify("Autoresearch mode ON — no autoresearch.md found, setting up", "info");
         pi.sendUserMessage(
-          `Start autoresearch: ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`
+          `Start autoresearch: ${trimmedArgs} ${EVALUATION_GUARDRAIL}`
         );
       }
     },

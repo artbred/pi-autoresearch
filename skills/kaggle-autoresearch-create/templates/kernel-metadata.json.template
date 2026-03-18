@@ -1,0 +1,16 @@
+{
+  "id": "__KERNEL_OWNER__/__KERNEL_SLUG__",
+  "title": "__KERNEL_TITLE__",
+  "code_file": "notebook.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "competition_sources": [
+    "__COMPETITION_SLUG__"
+  ],
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

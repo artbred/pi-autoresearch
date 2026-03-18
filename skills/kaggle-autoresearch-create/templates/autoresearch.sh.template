@@ -1,0 +1,579 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE="${1:---local-only}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
+
+COMPETITION_SLUG="${COMPETITION_SLUG:-__COMPETITION_SLUG__}"
+COMPETITION_URL="${COMPETITION_URL:-__COMPETITION_URL__}"
+KERNEL_OWNER="${KERNEL_OWNER:-__KERNEL_OWNER__}"
+KERNEL_SLUG="${KERNEL_SLUG:-__KERNEL_SLUG__}"
+KERNEL_REF="${KERNEL_OWNER}/${KERNEL_SLUG}"
+LEADERBOARD_TEAM_NAME="${LEADERBOARD_TEAM_NAME:-}"
+
+NOTEBOOK_SRC="${NOTEBOOK_SRC:-notebook.py}"
+NOTEBOOK_IPYNB="${NOTEBOOK_IPYNB:-notebook.ipynb}"
+LOCAL_RUN_CMD="${LOCAL_RUN_CMD:-python3 ${NOTEBOOK_SRC}}"
+METRICS_FILE="${METRICS_FILE:-outputs/metrics.json}"
+SUBMISSION_FILE="${SUBMISSION_FILE:-__SUBMISSION_ARTIFACT__}"
+STATE_FILE="${STATE_FILE:-outputs/kaggle_state.json}"
+KERNEL_OUTPUT_DIR="${KERNEL_OUTPUT_DIR:-outputs/kernel-output}"
+PENDING_SUBMISSION_QUEUE="${PENDING_SUBMISSION_QUEUE:-outputs/pending_submission_queue.jsonl}"
+
+PLACEHOLDER_PUBLIC_RANK="${PLACEHOLDER_PUBLIC_RANK:-999999}"
+PLACEHOLDER_PUBLIC_SCORE="${PLACEHOLDER_PUBLIC_SCORE:-0}"
+MAX_DAILY_SUBMISSIONS="${MAX_DAILY_SUBMISSIONS:-__SUBMISSION_CAP__}"
+KERNEL_STATUS_POLL_SECONDS="${KERNEL_STATUS_POLL_SECONDS:-20}"
+KERNEL_STATUS_MAX_POLLS="${KERNEL_STATUS_MAX_POLLS:-45}"
+POST_SUBMIT_SLEEP_SECONDS="${POST_SUBMIT_SLEEP_SECONDS:-10}"
+
+mkdir -p "$(dirname "$METRICS_FILE")" "$KERNEL_OUTPUT_DIR"
+CURRENT_SUBMISSION_COUNT=""
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+emit_metric() {
+  local name="$1"
+  local value="$2"
+  echo "METRIC ${name}=${value}"
+}
+
+load_env_file_if_present() {
+  local env_file="${KAGGLE_ENV_FILE:-.env}"
+  if [[ -f "$env_file" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$env_file"
+    set +a
+  fi
+}
+
+load_kaggle_auth() {
+  load_env_file_if_present
+
+  if [[ -n "${KAGGLE_USERNAME_FILE:-}" && -z "${KAGGLE_USERNAME:-}" && -f "${KAGGLE_USERNAME_FILE}" ]]; then
+    export KAGGLE_USERNAME
+    KAGGLE_USERNAME="$(tr -d '\r\n' < "${KAGGLE_USERNAME_FILE}")"
+  fi
+
+  if [[ -n "${KAGGLE_API_TOKEN:-}" && -z "${KAGGLE_KEY:-}" ]]; then
+    export KAGGLE_KEY
+    KAGGLE_KEY="${KAGGLE_API_TOKEN}"
+  fi
+
+  local config_dir="${KAGGLE_CONFIG_DIR:-$HOME/.kaggle}"
+  local token_file="${KAGGLE_TOKEN_FILE:-}"
+  if [[ -z "$token_file" ]]; then
+    for candidate in \
+      "${config_dir}/access_token" \
+      "${config_dir}/access_token.txt" \
+      "${ROOT_DIR}/.kaggle/access_token" \
+      "${ROOT_DIR}/.kaggle/access_token.txt"
+    do
+      if [[ -f "$candidate" ]]; then
+        token_file="$candidate"
+        break
+      fi
+    done
+  fi
+
+  if [[ -n "$token_file" && -z "${KAGGLE_KEY:-}" ]]; then
+    export KAGGLE_KEY
+    KAGGLE_KEY="$(tr -d '\r\n' < "$token_file")"
+  fi
+}
+
+resolve_leaderboard_team_name() {
+  if [[ -z "${LEADERBOARD_TEAM_NAME:-}" ]]; then
+    LEADERBOARD_TEAM_NAME="${KAGGLE_USERNAME:-$KERNEL_OWNER}"
+  fi
+}
+
+detect_local_accelerator() {
+  if [[ -n "${LOCAL_ACCELERATOR:-}" ]]; then
+    printf '%s\n' "$LOCAL_ACCELERATOR"
+    return 0
+  fi
+
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    printf 'cuda\n'
+    return 0
+  fi
+
+  if command -v rocm-smi >/dev/null 2>&1; then
+    printf 'rocm\n'
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<'PY'
+try:
+    import torch
+except Exception:
+    print("cpu")
+    raise SystemExit(0)
+
+try:
+    if torch.cuda.is_available():
+        print("cuda")
+        raise SystemExit(0)
+except Exception:
+    pass
+
+try:
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        print("mps")
+        raise SystemExit(0)
+except Exception:
+    pass
+
+print("cpu")
+PY
+    return 0
+  fi
+
+  printf 'cpu\n'
+}
+
+prepare_local_accelerator() {
+  export LOCAL_ACCELERATOR="${LOCAL_ACCELERATOR:-$(detect_local_accelerator)}"
+  echo "INFO local_accelerator=${LOCAL_ACCELERATOR}"
+}
+
+ensure_state_file() {
+  python3 - "$STATE_FILE" "$PLACEHOLDER_PUBLIC_RANK" "$PLACEHOLDER_PUBLIC_SCORE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+state_path = Path(sys.argv[1])
+rank = float(sys.argv[2])
+score = float(sys.argv[3])
+
+if not state_path.exists():
+    state_path.write_text(
+        json.dumps(
+            {
+                "public_rank": rank,
+                "public_score": score,
+                "submission_count": 0,
+                "last_submission_path": "",
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+PY
+}
+
+read_state_value() {
+  local key="$1"
+  local default_value="$2"
+  python3 - "$STATE_FILE" "$key" "$default_value" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+state_path = Path(sys.argv[1])
+key = sys.argv[2]
+default_value = sys.argv[3]
+
+if not state_path.exists():
+    print(default_value)
+    raise SystemExit(0)
+
+payload = json.loads(state_path.read_text())
+print(payload.get(key, default_value))
+PY
+}
+
+read_metrics_value() {
+  local key="$1"
+  local default_value="$2"
+  python3 - "$METRICS_FILE" "$key" "$default_value" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+metrics_path = Path(sys.argv[1])
+key = sys.argv[2]
+default_value = sys.argv[3]
+
+if not metrics_path.exists():
+    print(default_value)
+    raise SystemExit(0)
+
+payload = json.loads(metrics_path.read_text())
+print(payload.get(key, default_value))
+PY
+}
+
+require_kaggle_auth() {
+  local config_dir="${KAGGLE_CONFIG_DIR:-$HOME/.kaggle}"
+  local legacy_json_path="${config_dir}/kaggle.json"
+  load_kaggle_auth
+  resolve_leaderboard_team_name
+
+  if [[ -n "${KAGGLE_KEY:-}" && -z "${KAGGLE_USERNAME:-}" && ! -f "$legacy_json_path" ]]; then
+    die "Kaggle token found, but KAGGLE_USERNAME is missing. Set KAGGLE_USERNAME in the environment, ${KAGGLE_ENV_FILE:-.env}, or keep using ${legacy_json_path}."
+  fi
+
+  if [[ -n "${KAGGLE_USERNAME:-}" && -n "${KAGGLE_KEY:-}" ]]; then
+    return 0
+  fi
+
+  [[ -f "$legacy_json_path" ]] || die "Missing Kaggle credentials. Supported sources: KAGGLE_USERNAME/KAGGLE_KEY in the environment, ${KAGGLE_ENV_FILE:-.env}, KAGGLE_TOKEN_FILE or access_token, or ${legacy_json_path}."
+}
+
+verify_competition_access() {
+  if ! kaggle competitions files "$COMPETITION_SLUG" -q >/dev/null 2>&1; then
+    die "Unable to access ${COMPETITION_SLUG}. Authenticate the Kaggle CLI and accept the competition rules at ${COMPETITION_URL}/rules."
+  fi
+}
+
+run_local_pipeline() {
+  require_cmd python3
+  prepare_local_accelerator
+  python3 build_notebook.py --input "$NOTEBOOK_SRC" --output "$NOTEBOOK_IPYNB" >/dev/null
+
+  local log_file="outputs/local-run.log"
+  set +e
+  bash -lc "$LOCAL_RUN_CMD" 2>&1 | tee "$log_file"
+  local status=${PIPESTATUS[0]}
+  set -e
+
+  [[ $status -eq 0 ]] || die "Local run failed with exit code ${status}."
+  [[ -f "$METRICS_FILE" ]] || die "Local run did not create metrics file: $METRICS_FILE"
+  [[ -f "$SUBMISSION_FILE" ]] || die "Local run did not create submission artifact: $SUBMISSION_FILE"
+}
+
+fetch_submissions_csv() {
+  local output_path="$1"
+  kaggle competitions submissions "$COMPETITION_SLUG" -v -q >"$output_path"
+}
+
+count_recent_submissions() {
+  local submissions_csv="$1"
+  python3 - "$submissions_csv" <<'PY'
+import csv
+import datetime as dt
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    print(0)
+    raise SystemExit(0)
+
+rows = list(csv.DictReader(path.open(newline="")))
+if not rows:
+    print(0)
+    raise SystemExit(0)
+
+date_key = next((key for key in rows[0].keys() if "date" in key.lower() or "time" in key.lower()), None)
+if not date_key:
+    print(len(rows))
+    raise SystemExit(0)
+
+today = dt.datetime.now().date()
+count = 0
+parsed_any = False
+for row in rows:
+    raw = (row.get(date_key) or "").strip()
+    if not raw:
+        continue
+    candidate = raw.replace("Z", "+00:00")
+    parsed = None
+    for parser in (
+        lambda value: dt.datetime.fromisoformat(value),
+        lambda value: dt.datetime.strptime(value, "%Y-%m-%d %H:%M:%S"),
+        lambda value: dt.datetime.strptime(value, "%Y-%m-%d"),
+    ):
+        try:
+            parsed = parser(candidate)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        continue
+    parsed_any = True
+    if parsed.date() == today:
+        count += 1
+
+print(count if parsed_any else len(rows))
+PY
+}
+
+submission_budget_reached() {
+  local submissions_csv="outputs/submissions-before.csv"
+  fetch_submissions_csv "$submissions_csv"
+  CURRENT_SUBMISSION_COUNT="$(count_recent_submissions "$submissions_csv")"
+
+  [[ "$MAX_DAILY_SUBMISSIONS" =~ ^[0-9]+$ ]] || die "MAX_DAILY_SUBMISSIONS must be numeric, got: ${MAX_DAILY_SUBMISSIONS}"
+  [[ "$CURRENT_SUBMISSION_COUNT" =~ ^[0-9]+$ ]] || CURRENT_SUBMISSION_COUNT="0"
+
+  if (( CURRENT_SUBMISSION_COUNT >= MAX_DAILY_SUBMISSIONS )); then
+    return 0
+  fi
+
+  return 1
+}
+
+wait_for_kernel() {
+  local attempt
+  for (( attempt = 1; attempt <= KERNEL_STATUS_MAX_POLLS; attempt++ )); do
+    local status
+    status="$(kaggle kernels status "$KERNEL_REF" 2>&1 | tr -d '\r')"
+    echo "$status"
+    local lowered
+    lowered="$(echo "$status" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$lowered" == *"complete"* ]]; then
+      return 0
+    fi
+    if [[ "$lowered" == *"fail"* || "$lowered" == *"error"* || "$lowered" == *"cancel"* || "$lowered" == *"invalid"* ]]; then
+      die "Kernel execution failed: $status"
+    fi
+    sleep "$KERNEL_STATUS_POLL_SECONDS"
+  done
+
+  die "Kernel did not complete after ${KERNEL_STATUS_MAX_POLLS} polls."
+}
+
+download_kernel_output() {
+  rm -rf "$KERNEL_OUTPUT_DIR"
+  mkdir -p "$KERNEL_OUTPUT_DIR"
+  kaggle kernels output "$KERNEL_REF" -p "$KERNEL_OUTPUT_DIR" -o -q >/dev/null
+
+  local submission_name
+  submission_name="$(basename "$SUBMISSION_FILE")"
+  local kernel_submission="${KERNEL_OUTPUT_DIR}/${submission_name}"
+  [[ -f "$kernel_submission" ]] || die "Kernel outputs did not contain ${submission_name}."
+  echo "$kernel_submission"
+}
+
+submit_to_competition() {
+  local submission_path="$1"
+  local cv_score="$2"
+  local message="autoresearch $(date +%Y-%m-%dT%H:%M:%S) cv=${cv_score}"
+  kaggle competitions submit "$COMPETITION_SLUG" -f "$submission_path" -m "$message"
+}
+
+download_leaderboard_csv() {
+  kaggle competitions leaderboard "$COMPETITION_SLUG" -d -p "$KERNEL_OUTPUT_DIR" -q >/dev/null
+  local leaderboard_file
+  leaderboard_file="$(find "$KERNEL_OUTPUT_DIR" -maxdepth 1 -type f -iname '*leaderboard*' | sort | tail -n 1)"
+  [[ -n "$leaderboard_file" ]] || die "Leaderboard download file not found in ${KERNEL_OUTPUT_DIR}."
+  echo "$leaderboard_file"
+}
+
+extract_public_metrics() {
+  local leaderboard_csv="$1"
+  local submissions_csv="$2"
+  python3 - "$leaderboard_csv" "$submissions_csv" "$LEADERBOARD_TEAM_NAME" "${KAGGLE_USERNAME:-$KERNEL_OWNER}" <<'PY'
+import csv
+import json
+import sys
+from pathlib import Path
+
+leaderboard_path = Path(sys.argv[1])
+submissions_path = Path(sys.argv[2])
+expected_names = {name.strip().casefold() for name in sys.argv[3:] if name.strip()}
+
+if not leaderboard_path.exists():
+    raise SystemExit("Missing leaderboard download.")
+
+leaderboard_rows = list(csv.DictReader(leaderboard_path.open(newline="")))
+if not leaderboard_rows:
+    raise SystemExit("Leaderboard download was empty.")
+
+rank_key = next((key for key in leaderboard_rows[0] if "rank" in key.lower()), None)
+score_key = next((key for key in leaderboard_rows[0] if "score" in key.lower()), None)
+name_keys = [key for key in leaderboard_rows[0] if any(token in key.lower() for token in ("team", "user", "name", "display"))]
+
+if not rank_key or not score_key or not name_keys:
+    raise SystemExit("Could not infer leaderboard columns for rank, score, and team name.")
+
+match = None
+for row in leaderboard_rows:
+    values = {(row.get(key) or "").strip().casefold() for key in name_keys}
+    if values & expected_names:
+        match = row
+        break
+
+if match is None:
+    raise SystemExit(
+        "Could not find the configured team on the downloaded leaderboard. "
+        "Set LEADERBOARD_TEAM_NAME to the exact team name if it differs from the Kaggle username."
+    )
+
+submissions_rows = []
+if submissions_path.exists():
+    submissions_rows = list(csv.DictReader(submissions_path.open(newline="")))
+
+latest_score = None
+if submissions_rows:
+    submission_score_key = next((key for key in submissions_rows[0] if "score" in key.lower()), None)
+    if submission_score_key:
+        latest_score = submissions_rows[0].get(submission_score_key)
+
+payload = {
+    "public_rank": float(match[rank_key]),
+    "public_score": float(latest_score if latest_score not in (None, "") else match[score_key]),
+}
+print(json.dumps(payload))
+PY
+}
+
+persist_state() {
+  local public_rank="$1"
+  local public_score="$2"
+  local submission_count="$3"
+  local submission_path="$4"
+
+  python3 - "$STATE_FILE" "$public_rank" "$public_score" "$submission_count" "$submission_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+state_path = Path(sys.argv[1])
+payload = {
+    "public_rank": float(sys.argv[2]),
+    "public_score": float(sys.argv[3]),
+    "submission_count": int(float(sys.argv[4])),
+    "last_submission_path": sys.argv[5],
+}
+state_path.write_text(json.dumps(payload, indent=2) + "\n")
+PY
+}
+
+emit_local_metrics() {
+  local submission_count="${1:-$(read_state_value "submission_count" "0")}"
+  local cv_score
+  cv_score="$(read_metrics_value "cv_score" "0")"
+  emit_metric "public_rank" "$(read_state_value "public_rank" "$PLACEHOLDER_PUBLIC_RANK")"
+  emit_metric "public_score" "$(read_state_value "public_score" "$PLACEHOLDER_PUBLIC_SCORE")"
+  emit_metric "cv_score" "$cv_score"
+  emit_metric "submission_count" "$submission_count"
+}
+
+queue_pending_candidate() {
+  local cv_score="$1"
+  local public_rank="$2"
+  local public_score="$3"
+  local submission_count="$4"
+
+  python3 - "$PENDING_SUBMISSION_QUEUE" "$COMPETITION_SLUG" "$cv_score" "$public_rank" "$public_score" "$submission_count" "$SUBMISSION_FILE" "$LOCAL_ACCELERATOR" <<'PY'
+import json
+import sys
+import time
+from pathlib import Path
+
+queue_path = Path(sys.argv[1])
+queue_path.parent.mkdir(parents=True, exist_ok=True)
+payload = {
+    "timestamp": int(time.time()),
+    "competition_slug": sys.argv[2],
+    "cv_score": float(sys.argv[3]),
+    "public_rank": float(sys.argv[4]),
+    "public_score": float(sys.argv[5]),
+    "submission_count": int(float(sys.argv[6])),
+    "submission_file": sys.argv[7],
+    "local_accelerator": sys.argv[8],
+    "status": "pending_submission_window",
+}
+with queue_path.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(payload) + "\n")
+PY
+}
+
+handle_submission_budget_pause() {
+  local cv_score
+  local public_rank
+  local public_score
+  local last_submission_path
+
+  cv_score="$(read_metrics_value "cv_score" "0")"
+  public_rank="$(read_state_value "public_rank" "$PLACEHOLDER_PUBLIC_RANK")"
+  public_score="$(read_state_value "public_score" "$PLACEHOLDER_PUBLIC_SCORE")"
+  last_submission_path="$(read_state_value "last_submission_path" "")"
+
+  queue_pending_candidate "$cv_score" "$public_rank" "$public_score" "$CURRENT_SUBMISSION_COUNT"
+  persist_state "$public_rank" "$public_score" "$CURRENT_SUBMISSION_COUNT" "$last_submission_path"
+
+  echo "INFO submission_budget_reached=1"
+  echo "INFO submission_window=closed"
+  echo "INFO submission_count=${CURRENT_SUBMISSION_COUNT}/${MAX_DAILY_SUBMISSIONS}"
+  echo "INFO continue_mode=local_only"
+  echo "INFO queued_candidate=${PENDING_SUBMISSION_QUEUE}"
+
+  emit_local_metrics "$CURRENT_SUBMISSION_COUNT"
+}
+
+submit_mode() {
+  require_cmd kaggle
+  require_kaggle_auth
+  verify_competition_access
+  if submission_budget_reached; then
+    handle_submission_budget_pause
+    return 0
+  fi
+
+  kaggle kernels push -p "$ROOT_DIR"
+  wait_for_kernel
+
+  local kernel_submission
+  kernel_submission="$(download_kernel_output)"
+
+  local cv_score
+  cv_score="$(read_metrics_value "cv_score" "0")"
+  submit_to_competition "$kernel_submission" "$cv_score"
+  sleep "$POST_SUBMIT_SLEEP_SECONDS"
+
+  local submissions_csv="outputs/submissions-after.csv"
+  fetch_submissions_csv "$submissions_csv"
+
+  local leaderboard_csv
+  leaderboard_csv="$(download_leaderboard_csv)"
+
+  local public_metrics
+  public_metrics="$(extract_public_metrics "$leaderboard_csv" "$submissions_csv")"
+  local public_rank
+  local public_score
+  public_rank="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["public_rank"])' <<<"$public_metrics")"
+  public_score="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["public_score"])' <<<"$public_metrics")"
+  local submission_count
+  submission_count="$(count_recent_submissions "$submissions_csv")"
+
+  persist_state "$public_rank" "$public_score" "$submission_count" "$kernel_submission"
+
+  emit_metric "public_rank" "$public_rank"
+  emit_metric "public_score" "$public_score"
+  emit_metric "cv_score" "$cv_score"
+  emit_metric "submission_count" "$submission_count"
+}
+
+load_env_file_if_present
+resolve_leaderboard_team_name
+ensure_state_file
+run_local_pipeline
+
+case "$MODE" in
+  --local-only)
+    emit_local_metrics
+    ;;
+  --submit)
+    submit_mode
+    ;;
+  *)
+    die "Unsupported mode: $MODE. Use --local-only or --submit."
+    ;;
+esac

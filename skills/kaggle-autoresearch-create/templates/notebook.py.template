@@ -1,0 +1,112 @@
+# %% [markdown]
+# # __COMPETITION_TITLE__ First-Place Chase
+#
+# This file is the editable source of truth for the Kaggle submission notebook.
+# `build_notebook.py` renders it to `notebook.ipynb` for `kaggle kernels push`.
+#
+# Replace the toy pipeline below with the real feature engineering, training,
+# ensembling, and submission logic for `__COMPETITION_SLUG__`.
+
+# %%
+from __future__ import annotations
+
+import csv
+import json
+import os
+from pathlib import Path
+from statistics import fmean
+
+
+COMPETITION_SLUG = "__COMPETITION_SLUG__"
+ID_COLUMN = "__ID_COLUMN__"
+TARGET_COLUMN = "__TARGET_COLUMN__"
+CV_METRIC_NAME = "__CV_METRIC_NAME__"
+SUBMISSION_FILENAME = "__SUBMISSION_FILENAME__"
+LOCAL_ACCELERATOR = os.environ.get("LOCAL_ACCELERATOR", "cpu")
+
+ROOT = Path(".")
+DATA_DIR = ROOT / "data"
+OUTPUT_DIR = ROOT / "outputs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+SUBMISSION_PATH = OUTPUT_DIR / SUBMISSION_FILENAME
+METRICS_PATH = OUTPUT_DIR / "metrics.json"
+
+
+def load_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open(newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def synthetic_training_rows() -> list[dict[str, str]]:
+    return [
+        {ID_COLUMN: str(idx), TARGET_COLUMN: f"{0.1 + idx * 0.01:.6f}"}
+        for idx in range(1, 21)
+    ]
+
+
+def synthetic_test_rows() -> list[dict[str, str]]:
+    return [{ID_COLUMN: str(idx)} for idx in range(21, 31)]
+
+
+def load_training_rows() -> list[dict[str, str]]:
+    return load_rows(DATA_DIR / "train.csv") or synthetic_training_rows()
+
+
+def load_test_rows() -> list[dict[str, str]]:
+    return load_rows(DATA_DIR / "test.csv") or synthetic_test_rows()
+
+
+def estimate_cv_score(train_rows: list[dict[str, str]]) -> float:
+    targets = [float(row[TARGET_COLUMN]) for row in train_rows if TARGET_COLUMN in row]
+    if not targets:
+        return 0.0
+    return round(fmean(targets), 6)
+
+
+def build_predictions(test_rows: list[dict[str, str]], cv_score: float) -> list[dict[str, str]]:
+    prediction = f"{cv_score:.6f}"
+    return [
+        {
+            ID_COLUMN: row.get(ID_COLUMN, str(idx)),
+            TARGET_COLUMN: prediction,
+        }
+        for idx, row in enumerate(test_rows, start=1)
+    ]
+
+
+def write_submission(predictions: list[dict[str, str]]) -> None:
+    with SUBMISSION_PATH.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=[ID_COLUMN, TARGET_COLUMN])
+        writer.writeheader()
+        writer.writerows(predictions)
+
+
+def write_metrics(cv_score: float) -> None:
+    payload = {
+        "cv_score": cv_score,
+        "submission_path": str(SUBMISSION_PATH),
+        "competition_slug": COMPETITION_SLUG,
+        "local_accelerator": LOCAL_ACCELERATOR,
+    }
+    METRICS_PATH.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def main() -> int:
+    train_rows = load_training_rows()
+    test_rows = load_test_rows()
+    cv_score = estimate_cv_score(train_rows)
+    predictions = build_predictions(test_rows, cv_score)
+    write_submission(predictions)
+    write_metrics(cv_score)
+
+    print(f"Prepared submission for {COMPETITION_SLUG}")
+    print(f"{CV_METRIC_NAME}={cv_score}")
+    print(f"submission_path={SUBMISSION_PATH}")
+    print(f"local_accelerator={LOCAL_ACCELERATOR}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
