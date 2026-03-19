@@ -9,6 +9,9 @@ Win the Kaggle competition `__COMPETITION_SLUG__` by iterating on notebook submi
 - Slug: __COMPETITION_SLUG__
 - Evaluation metric: __EVALUATION_METRIC__
 - Deadline: __DEADLINE__
+- Competition mode: __COMPETITION_MODE__
+- Score acquisition path: __SCORE_ACQUISITION_PATH__
+- Internet policy: __INTERNET_POLICY__
 - Resource flags: __RESOURCE_FLAGS__
 
 ## Metrics
@@ -53,12 +56,25 @@ Win the Kaggle competition `__COMPETITION_SLUG__` by iterating on notebook submi
 - Forbidden datasets or patterns: __FORBIDDEN_PATTERNS__
 - Notes from the rules page: __RULE_NOTES__
 
+## Dependency Packaging
+- Offline or custom dependency plan: __DEPENDENCY_PACKAGING__
+- Wheel dataset or model attachments: __OFFLINE_ASSET_SOURCES__
+- Install flow inside notebook: __OFFLINE_INSTALL_FLOW__
+- Mounted asset paths to validate: __MOUNTED_ASSET_PATHS__
+
 ## Submission Budget
 - Daily submission cap: __SUBMISSION_CAP__
 - Operating policy: use `--local-only` for triage, reserve `--submit` for notebook variants with a real CV or robustness story.
 - Current reserve policy: __SUBMISSION_POLICY__
 - When the cap is reached, do not stop the loop. Continue local iterations, write the strongest candidates to the pending submission queue, and resume leaderboard validation when the window reopens.
 - Local accelerator strategy: detect CUDA / ROCm / MPS and use GPU-backed runs whenever the machine supports them.
+
+## Submission Mechanics
+- Primary submission path: __SUBMISSION_PATH__
+- Notebook version required before scoring: __NOTEBOOK_VERSION_REQUIREMENT__
+- `submission.csv` required after notebook run: __SUBMISSION_FILE_REQUIREMENT__
+- How a new score appears: __SCORE_REFRESH_NOTES__
+- Competition-specific upload edge cases: __UPLOAD_EDGE_CASES__
 
 ## Local Validation Strategy
 - Validation metric: `__CV_METRIC_NAME__`

@@ -150,6 +150,7 @@ Every result is appended to `autoresearch.jsonl` in your project — one line pe
 `kaggle-autoresearch-create` keeps the extension generic while giving the agent a Kaggle-specific playbook:
 
 - Research the competition page, rules, discussions, public notebooks, and allowed external datasets.
+- Classify the competition first: file-upload, notebook-only/code-submission, hybrid notebook-plus-file, or offline asset-backed workflow.
 - Maintain `autoresearch.md` as the competition memory file: rules, leakage bans, leaderboard history, discussion ideas, and notebook variants.
 - Edit `notebook.py`, render it into `notebook.ipynb`, and submit through the Kaggle CLI.
 - Optimize for `public_rank` with `lower` as better while tracking `public_score`, `cv_score`, and `submission_count`.
@@ -161,6 +162,13 @@ The generated `autoresearch.sh` supports two modes:
 - If the daily Kaggle submission cap is already exhausted, `./autoresearch.sh --submit` does not stop the loop. It records the candidate in a pending queue, carries forward the last known public metrics, and keeps the loop in local iteration mode until submissions reopen.
 
 The generated local path also detects the best local accelerator it can find and exports `LOCAL_ACCELERATOR` for the notebook or training command. Out of the box it checks for CUDA, ROCm, and MPS, so the agent can keep using GPU-backed local experiments while the submission window is closed.
+
+Important edge case: not every competition uses the same score path. The Kaggle skill now expects the agent to distinguish between:
+
+- file-upload competitions, where `submission.csv` goes straight to the competition page or `kaggle competitions submit`
+- notebook-only or code competitions, where the notebook version itself is the scored submission
+- hybrid competitions, where the notebook must run first and the resulting `submission.csv` must then be uploaded
+- internet-off notebook competitions, where wheels or other custom dependencies must be uploaded as datasets and installed from mounted paths because `enable_internet` is `false`
 
 ### Kaggle prerequisites
 
