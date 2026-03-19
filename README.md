@@ -7,9 +7,9 @@
 
 </div>
 
-*Try an idea, measure it, keep what works, discard what doesn't, repeat.*
+*Run Kaggle experiments, score real submissions, keep what improves, repeat.*
 
-Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch). This package provides a reusable autoresearch loop for pi: one generic extension plus domain-specific skills. It works for classic optimization problems like test speed or build time, and it now also ships with a Kaggle-first competition skill.
+Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch). This package provides a Kaggle-first autoresearch loop for pi: a reusable extension plus a single Kaggle competition skill.
 
 ---
 
@@ -30,7 +30,7 @@ The core loop is simple:
 5. Revert it if it did not.
 6. Repeat until interrupted.
 
-The extension provides the generic mechanics for this loop. The skill provides the domain knowledge for what to optimize and how to run it.
+The extension provides the mechanics for this loop. The Kaggle skill provides the competition-specific judgment for what to optimize and how to run it.
 
 That split matters:
 
@@ -59,7 +59,6 @@ That gives you an optimization loop that survives restarts, context resets, and 
 | Part | Purpose |
 |---|---|
 | Extension | Tools, widget, dashboard, `/autoresearch` command |
-| `autoresearch-create` | Generic optimization skill |
 | `kaggle-autoresearch` | Kaggle competition skill |
 
 ### Extension Tools
@@ -81,9 +80,9 @@ That gives you an optimization loop that survives restarts, context resets, and 
 Examples:
 
 ```text
-/autoresearch optimize unit test runtime, monitor correctness
-/autoresearch model training, run 5 minutes of train.py and note the loss ratio as optimization target
 /autoresearch chase first place in titanic, mine discussions, and iterate on notebook submissions
+/autoresearch run kaggle autoresearch for house-prices and keep submitting the best legal candidates
+/autoresearch set up a notebook-first kaggle loop for the current competition and keep climbing the leaderboard
 ```
 
 ### UI
@@ -114,25 +113,9 @@ Then run `/reload` in pi.
 
 ## Usage
 
-### Generic Autoresearch
-
-Use the generic skill when you want to optimize a measurable workload:
-
-```text
-/skill:autoresearch-create
-```
-
-Typical examples:
-
-- test runtime
-- build time
-- bundle size
-- model loss
-- Lighthouse score
-
 ### Kaggle Autoresearch
 
-Use the Kaggle skill when the problem is not just "optimize code" but "win or climb a Kaggle competition":
+This package ships only the Kaggle skill:
 
 ```text
 /skill:kaggle-autoresearch
@@ -200,7 +183,7 @@ The skill is supposed to understand:
 - what notebook wall-clock limit the scored run must fit inside
 - how the next score actually appears for this competition
 
-That is why the Kaggle skill is more detailed than the generic skill.
+That is why the Kaggle skill is detailed and competition-specific.
 
 ## Kaggle Workflow
 
@@ -317,20 +300,15 @@ Before the first real submission:
 - confirm how a new score is supposed to appear
 - set `LEADERBOARD_TEAM_NAME` only if automatic leaderboard matching needs an explicit team/display name
 
-## Example Domains
+## Example Domain
 
 | Domain | Metric | Command |
 |---|---|---|
-| Test speed | seconds ↓ | `pnpm test` |
-| Bundle size | KB ↓ | `pnpm build && du -sb dist` |
-| LLM training | val_bpb ↓ | `uv run train.py` |
-| Build speed | seconds ↓ | `pnpm build` |
-| Lighthouse | perf score ↑ | `lighthouse http://localhost:3000 --output=json` |
 | Kaggle competition | public rank ↓ | `./autoresearch.sh --submit` |
 
 ## How It Works
 
-The extension is intentionally generic. The skills carry the domain logic.
+The extension handles the loop mechanics. The Kaggle skill carries the domain logic.
 
 ```text
 Extension:
@@ -339,18 +317,13 @@ Extension:
   widget + dashboard
   autoresearch mode
 
-Generic skill:
-  command: pnpm test
-  metric: seconds
-  scope: code and config
-
 Kaggle skill:
   command: ./autoresearch.sh --submit
   metric: public_rank
   scope: notebook, assets, submission flow, competition rules
 ```
 
-This keeps one infrastructure layer and multiple domain playbooks.
+This keeps one infrastructure layer with one Kaggle-specific playbook.
 
 ## Session Persistence
 
