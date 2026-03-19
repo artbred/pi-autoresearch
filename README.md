@@ -70,7 +70,7 @@ pi install https://github.com/davebcn87/pi-autoresearch
 - **Fullscreen overlay** — `Ctrl+Shift+X` opens a scrollable full-terminal dashboard. Shows a live spinner with elapsed time for running experiments.
 ### Skill
 
-`autoresearch-create` handles generic optimization targets. `kaggle-autoresearch-create` is the new Kaggle-first skill for competition workflows. It asks or infers the competition slug, notebook paths, validation metric, submission artifact, file scope, and constraints — then writes the session files and starts the loop.
+`autoresearch-create` handles generic optimization targets. `kaggle-autoresearch` is the Kaggle-first skill for competition workflows. It asks or infers the competition slug, notebook paths, validation metric, submission artifact, file scope, and constraints — then writes the session files and starts the loop.
 
 | File | Purpose |
 |------|---------|
@@ -110,10 +110,10 @@ Then `/reload` in pi.
 
 ```
 /skill:autoresearch-create
-/skill:kaggle-autoresearch-create
+/skill:kaggle-autoresearch
 ```
 
-Use `/skill:autoresearch-create` for generic optimization work. Use `/skill:kaggle-autoresearch-create` for Kaggle competitions. The Kaggle skill asks about the competition, notebook paths, validation metric, submission artifact, file scope, and constraints, then creates a branch, writes the session files, runs a local baseline, and moves into leaderboard-focused iteration.
+Use `/skill:autoresearch-create` for generic optimization work. Use `/skill:kaggle-autoresearch` for Kaggle competitions. The Kaggle skill asks about the competition, notebook paths, validation metric, submission artifact, file scope, and constraints, then creates a branch, writes the session files, runs a local baseline, and moves into leaderboard-focused iteration.
 
 ### 2. The loop
 
@@ -147,7 +147,7 @@ Every result is appended to `autoresearch.jsonl` in your project — one line pe
 
 ## Kaggle First-Place Mode
 
-`kaggle-autoresearch-create` keeps the extension generic while giving the agent a Kaggle-specific playbook:
+`kaggle-autoresearch` keeps the extension generic while giving the agent a Kaggle-specific playbook:
 
 - Research the competition page, rules, discussions, public notebooks, and allowed external datasets.
 - Classify the competition first: file-upload, notebook-only/code-submission, hybrid notebook-plus-file, or offline asset-backed workflow.

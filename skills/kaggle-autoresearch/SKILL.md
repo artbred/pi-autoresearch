@@ -1,5 +1,5 @@
 ---
-name: kaggle-autoresearch-create
+name: kaggle-autoresearch
 description: Set up and run a Kaggle competition autoresearch loop focused on climbing the leaderboard with notebook submissions, discussion mining, and rules-safe public data reuse.
 ---
 
