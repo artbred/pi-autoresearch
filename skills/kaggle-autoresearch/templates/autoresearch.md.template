@@ -32,6 +32,8 @@ Win the Kaggle competition `__COMPETITION_SLUG__` by iterating on notebook submi
 ## How to Run
 - `./autoresearch.sh --local-only`
 - `./autoresearch.sh --submit`
+- `./autoresearch.sh --submit-candidate <candidate-id>`
+- `./autoresearch.sh --merge-candidates <candidate-id[,candidate-id...]>`
 
 ## Files in Scope
 - `notebook.py` — editable Kaggle notebook source of truth.
@@ -75,8 +77,10 @@ Win the Kaggle competition `__COMPETITION_SLUG__` by iterating on notebook submi
 - Daily submission cap: __SUBMISSION_CAP__
 - Operating policy: use `--local-only` for triage, reserve `--submit` for notebook variants with a real CV or robustness story.
 - Real-score policy: establish a public baseline early, and when quota is available do not let the loop sit in `--local-only` mode for long stretches without submitting the best compliant candidate for scoring.
+- Freshness gate: if several promising local keeps pass without a fresh public score, force a scored submission of the best ready candidate instead of continuing local-only drift.
 - Current reserve policy: __SUBMISSION_POLICY__
 - When the cap is reached, do not stop the loop. Continue local iterations, write the strongest candidates to the pending submission queue, and resume leaderboard validation when the window reopens.
+- Queue promotion policy: when submissions reopen, submit the highest-priority ready candidate first, not whichever artifact happened to be produced last.
 - Local accelerator strategy: detect CUDA / ROCm / MPS and use GPU-backed runs whenever the machine supports them.
 
 ## Submission Mechanics
@@ -120,6 +124,12 @@ Win the Kaggle competition `__COMPETITION_SLUG__` by iterating on notebook submi
 - Track the best local-only candidates here whenever the daily submission cap is exhausted or a submission is briefly staged for the next score refresh.
 - Do not let this queue become a substitute for real scoring while submission quota is still available.
 - Note the notebook variant, `cv_score`, robustness story, and why it should be first in line once submissions reopen.
+- Record `candidate_id`, merge inputs when relevant, pending priority, and whether the candidate came from `exploit`, `explore`, or `merge`.
+
+## Parallel Lane Notes
+- `exploit`:
+- `explore`:
+- `merge`:
 
 ## What's Been Tried
 - __TRIED_1__

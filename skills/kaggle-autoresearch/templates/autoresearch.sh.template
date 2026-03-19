@@ -2,6 +2,7 @@
 set -euo pipefail
 
 MODE="${1:---local-only}"
+MODE_ARG="${2:-}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
@@ -20,6 +21,7 @@ SUBMISSION_FILE="${SUBMISSION_FILE:-__SUBMISSION_ARTIFACT__}"
 STATE_FILE="${STATE_FILE:-outputs/kaggle_state.json}"
 KERNEL_OUTPUT_DIR="${KERNEL_OUTPUT_DIR:-outputs/kernel-output}"
 PENDING_SUBMISSION_QUEUE="${PENDING_SUBMISSION_QUEUE:-outputs/pending_submission_queue.jsonl}"
+CANDIDATES_DIR="${CANDIDATES_DIR:-outputs/candidates}"
 
 PLACEHOLDER_PUBLIC_RANK="${PLACEHOLDER_PUBLIC_RANK:-999999}"
 PLACEHOLDER_PUBLIC_SCORE="${PLACEHOLDER_PUBLIC_SCORE:-0}"
@@ -30,8 +32,9 @@ POST_SUBMIT_SLEEP_SECONDS="${POST_SUBMIT_SLEEP_SECONDS:-10}"
 NOTEBOOK_RUNTIME_LIMIT_SECONDS="${NOTEBOOK_RUNTIME_LIMIT_SECONDS:-__NOTEBOOK_RUNTIME_LIMIT_SECONDS__}"
 NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS="${NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS:-__NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS__}"
 NOTEBOOK_RUNTIME_BUDGET_SECONDS="${NOTEBOOK_RUNTIME_BUDGET_SECONDS:-__NOTEBOOK_RUNTIME_BUDGET_SECONDS__}"
+CV_DIRECTION="${CV_DIRECTION:-__CV_DIRECTION__}"
 
-mkdir -p "$(dirname "$METRICS_FILE")" "$KERNEL_OUTPUT_DIR"
+mkdir -p "$(dirname "$METRICS_FILE")" "$KERNEL_OUTPUT_DIR" "$CANDIDATES_DIR"
 CURRENT_SUBMISSION_COUNT=""
 
 die() {
@@ -170,6 +173,9 @@ if not state_path.exists():
                 "public_score": score,
                 "submission_count": 0,
                 "last_submission_path": "",
+                "last_public_metrics_timestamp": 0,
+                "last_submission_id": "",
+                "last_candidate_id": "",
             },
             indent=2,
         )
@@ -217,6 +223,168 @@ if not metrics_path.exists():
 
 payload = json.loads(metrics_path.read_text())
 print(payload.get(key, default_value))
+PY
+}
+
+normalize_candidate_id() {
+  local raw="${1:-}"
+  python3 - "$raw" <<'PY'
+import re
+import sys
+
+value = (sys.argv[1] or "").strip().lower()
+value = re.sub(r"[^a-z0-9._-]+", "-", value)
+value = re.sub(r"-{2,}", "-", value).strip("-")
+print(value or "candidate")
+PY
+}
+
+resolve_candidate_id() {
+  local preferred="${1:-}"
+  if [[ -n "$preferred" ]]; then
+    normalize_candidate_id "$preferred"
+    return 0
+  fi
+
+  local git_sha="nogit"
+  if command -v git >/dev/null 2>&1; then
+    git_sha="$(git rev-parse --short HEAD 2>/dev/null || printf 'nogit')"
+  fi
+  normalize_candidate_id "${COMPETITION_SLUG}-${git_sha}-$(date +%Y%m%d%H%M%S)"
+}
+
+candidate_dir() {
+  local candidate_id
+  candidate_id="$(normalize_candidate_id "$1")"
+  printf '%s/%s\n' "$CANDIDATES_DIR" "$candidate_id"
+}
+
+candidate_manifest_path() {
+  local candidate_id
+  candidate_id="$(normalize_candidate_id "$1")"
+  printf '%s/manifest.json\n' "$(candidate_dir "$candidate_id")"
+}
+
+candidate_submission_file() {
+  local manifest
+  manifest="$(candidate_manifest_path "$1")"
+  python3 - "$manifest" "$SUBMISSION_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+default_path = Path(sys.argv[2])
+if not manifest_path.exists():
+    raise SystemExit(f"Missing candidate manifest: {manifest_path}")
+
+payload = json.loads(manifest_path.read_text())
+submission_path = payload.get("submission_file") or str(default_path)
+print(submission_path)
+PY
+}
+
+candidate_metric_value() {
+  local candidate_id="$1"
+  local metric_key="$2"
+  local default_value="$3"
+  python3 - "$(candidate_manifest_path "$candidate_id")" "$metric_key" "$default_value" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+metric_key = sys.argv[2]
+default_value = sys.argv[3]
+if not manifest_path.exists():
+    print(default_value)
+    raise SystemExit(0)
+
+payload = json.loads(manifest_path.read_text())
+metrics = payload.get("metrics") or {}
+value = metrics.get(metric_key, payload.get(metric_key, default_value))
+print(value)
+PY
+}
+
+write_candidate_manifest() {
+  local candidate_id="$1"
+  local score_state="$2"
+  local merge_inputs="${3:-}"
+  local pending_priority="${4:-}"
+  local public_metrics_timestamp="${5:-}"
+  local submission_id="${6:-}"
+  local candidate_path
+  candidate_path="$(candidate_dir "$candidate_id")"
+  mkdir -p "$candidate_path"
+
+  python3 - \
+    "$(candidate_manifest_path "$candidate_id")" \
+    "$candidate_id" \
+    "$score_state" \
+    "$merge_inputs" \
+    "$pending_priority" \
+    "$public_metrics_timestamp" \
+    "$submission_id" \
+    "$METRICS_FILE" \
+    "$STATE_FILE" \
+    "$SUBMISSION_FILE" \
+    "${LOCAL_ACCELERATOR:-cpu}" <<'PY'
+import json
+import sys
+import time
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+candidate_id = sys.argv[2]
+score_state = sys.argv[3]
+merge_inputs = [item for item in sys.argv[4].split(",") if item]
+pending_priority = sys.argv[5]
+public_metrics_timestamp = sys.argv[6]
+submission_id = sys.argv[7]
+metrics_path = Path(sys.argv[8])
+state_path = Path(sys.argv[9])
+submission_file = sys.argv[10]
+local_accelerator = sys.argv[11]
+
+payload = {}
+if manifest_path.exists():
+    payload = json.loads(manifest_path.read_text())
+
+metrics = {}
+if metrics_path.exists():
+    metrics = json.loads(metrics_path.read_text())
+
+state = {}
+if state_path.exists():
+    state = json.loads(state_path.read_text())
+
+artifact_paths = []
+for candidate in [submission_file, str(metrics_path)]:
+    if candidate and Path(candidate).exists():
+        artifact_paths.append(candidate)
+
+payload.update(
+    {
+        "candidate_id": candidate_id,
+        "updated_at": int(time.time()),
+        "score_state": score_state,
+        "metrics": metrics,
+        "submission_file": submission_file,
+        "local_accelerator": local_accelerator,
+        "public_rank": state.get("public_rank"),
+        "public_score": state.get("public_score"),
+        "submission_count": state.get("submission_count"),
+        "public_metrics_timestamp": int(public_metrics_timestamp) if public_metrics_timestamp else payload.get("public_metrics_timestamp"),
+        "submission_id": submission_id or payload.get("submission_id"),
+        "merge_inputs": merge_inputs,
+        "pending_priority": float(pending_priority) if pending_priority not in ("", None) else payload.get("pending_priority"),
+        "artifact_paths": artifact_paths,
+    }
+)
+payload.setdefault("created_at", int(time.time()))
+
+manifest_path.write_text(json.dumps(payload, indent=2) + "\n")
 PY
 }
 
@@ -476,8 +644,11 @@ persist_state() {
   local public_score="$2"
   local submission_count="$3"
   local submission_path="$4"
+  local public_metrics_timestamp="${5:-0}"
+  local submission_id="${6:-}"
+  local candidate_id="${7:-}"
 
-  python3 - "$STATE_FILE" "$public_rank" "$public_score" "$submission_count" "$submission_path" <<'PY'
+  python3 - "$STATE_FILE" "$public_rank" "$public_score" "$submission_count" "$submission_path" "$public_metrics_timestamp" "$submission_id" "$candidate_id" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -488,6 +659,9 @@ payload = {
     "public_score": float(sys.argv[3]),
     "submission_count": int(float(sys.argv[4])),
     "last_submission_path": sys.argv[5],
+    "last_public_metrics_timestamp": int(float(sys.argv[6])) if sys.argv[6] not in ("", "0") else 0,
+    "last_submission_id": sys.argv[7],
+    "last_candidate_id": sys.argv[8],
 }
 state_path.write_text(json.dumps(payload, indent=2) + "\n")
 PY
@@ -504,12 +678,21 @@ emit_local_metrics() {
 }
 
 queue_pending_candidate() {
-  local cv_score="$1"
-  local public_rank="$2"
-  local public_score="$3"
-  local submission_count="$4"
+  local candidate_id="$1"
+  local submission_count="$2"
+  local merge_inputs="${3:-}"
+  local cv_score
+  local public_rank
+  local public_score
+  local submission_file
+  local priority
+  cv_score="$(candidate_metric_value "$candidate_id" "cv_score" "$(read_metrics_value "cv_score" "0")")"
+  public_rank="$(candidate_metric_value "$candidate_id" "public_rank" "$(read_state_value "public_rank" "$PLACEHOLDER_PUBLIC_RANK")")"
+  public_score="$(candidate_metric_value "$candidate_id" "public_score" "$(read_state_value "public_score" "$PLACEHOLDER_PUBLIC_SCORE")")"
+  submission_file="$(candidate_submission_file "$candidate_id")"
+  priority="$(candidate_metric_value "$candidate_id" "pending_priority" "$cv_score")"
 
-  python3 - "$PENDING_SUBMISSION_QUEUE" "$COMPETITION_SLUG" "$cv_score" "$public_rank" "$public_score" "$submission_count" "$SUBMISSION_FILE" "$LOCAL_ACCELERATOR" <<'PY'
+  python3 - "$PENDING_SUBMISSION_QUEUE" "$COMPETITION_SLUG" "$candidate_id" "$cv_score" "$public_rank" "$public_score" "$submission_count" "$submission_file" "${LOCAL_ACCELERATOR:-cpu}" "$priority" "$merge_inputs" <<'PY'
 import json
 import sys
 import time
@@ -520,12 +703,15 @@ queue_path.parent.mkdir(parents=True, exist_ok=True)
 payload = {
     "timestamp": int(time.time()),
     "competition_slug": sys.argv[2],
-    "cv_score": float(sys.argv[3]),
-    "public_rank": float(sys.argv[4]),
-    "public_score": float(sys.argv[5]),
-    "submission_count": int(float(sys.argv[6])),
-    "submission_file": sys.argv[7],
-    "local_accelerator": sys.argv[8],
+    "candidate_id": sys.argv[3],
+    "cv_score": float(sys.argv[4]),
+    "public_rank": float(sys.argv[5]),
+    "public_score": float(sys.argv[6]),
+    "submission_count": int(float(sys.argv[7])),
+    "submission_file": sys.argv[8],
+    "local_accelerator": sys.argv[9],
+    "priority": float(sys.argv[10]),
+    "merge_inputs": [item for item in sys.argv[11].split(",") if item],
     "status": "pending_submission_window",
 }
 with queue_path.open("a", encoding="utf-8") as handle:
@@ -533,47 +719,137 @@ with queue_path.open("a", encoding="utf-8") as handle:
 PY
 }
 
+select_best_pending_candidate() {
+  python3 - "$PENDING_SUBMISSION_QUEUE" "$CV_DIRECTION" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+queue_path = Path(sys.argv[1])
+cv_direction = (sys.argv[2] or "higher").strip().lower()
+if not queue_path.exists():
+    print("")
+    raise SystemExit(0)
+
+entries = []
+for line in queue_path.read_text().splitlines():
+    if not line.strip():
+        continue
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    candidate_id = payload.get("candidate_id")
+    if not candidate_id:
+        continue
+    entries.append(payload)
+
+if not entries:
+    print("")
+    raise SystemExit(0)
+
+latest = {}
+for entry in entries:
+    latest[entry["candidate_id"]] = entry
+
+ordered = list(latest.values())
+reverse = cv_direction == "higher"
+ordered.sort(key=lambda item: (item.get("priority", item.get("cv_score", 0.0)), -item.get("timestamp", 0)) if reverse else (item.get("priority", item.get("cv_score", 0.0)), item.get("timestamp", 0)), reverse=reverse)
+print(ordered[0]["candidate_id"])
+PY
+}
+
+remove_queued_candidate() {
+  local candidate_id="$1"
+  python3 - "$PENDING_SUBMISSION_QUEUE" "$candidate_id" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+queue_path = Path(sys.argv[1])
+candidate_id = sys.argv[2]
+if not queue_path.exists():
+    raise SystemExit(0)
+
+kept = []
+for line in queue_path.read_text().splitlines():
+    if not line.strip():
+        continue
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if payload.get("candidate_id") == candidate_id:
+        continue
+    kept.append(json.dumps(payload))
+
+queue_path.write_text("\n".join(kept) + ("\n" if kept else ""))
+PY
+}
+
+extract_latest_submission_id() {
+  local submissions_csv="$1"
+  python3 - "$submissions_csv" <<'PY'
+import csv
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    print("")
+    raise SystemExit(0)
+
+rows = list(csv.DictReader(path.open(newline="")))
+if not rows:
+    print("")
+    raise SystemExit(0)
+
+id_key = next((key for key in rows[0].keys() if "id" in key.lower()), None)
+if not id_key:
+    print("")
+    raise SystemExit(0)
+
+print(rows[0].get(id_key, ""))
+PY
+}
+
 handle_submission_budget_pause() {
+  local candidate_id="${1:-}"
   local cv_score
   local public_rank
   local public_score
   local last_submission_path
+  local last_public_metrics_timestamp
+  local last_submission_id
 
   cv_score="$(read_metrics_value "cv_score" "0")"
   public_rank="$(read_state_value "public_rank" "$PLACEHOLDER_PUBLIC_RANK")"
   public_score="$(read_state_value "public_score" "$PLACEHOLDER_PUBLIC_SCORE")"
   last_submission_path="$(read_state_value "last_submission_path" "")"
+  last_public_metrics_timestamp="$(read_state_value "last_public_metrics_timestamp" "0")"
+  last_submission_id="$(read_state_value "last_submission_id" "")"
 
-  queue_pending_candidate "$cv_score" "$public_rank" "$public_score" "$CURRENT_SUBMISSION_COUNT"
-  persist_state "$public_rank" "$public_score" "$CURRENT_SUBMISSION_COUNT" "$last_submission_path"
+  if [[ -n "$candidate_id" ]]; then
+    write_candidate_manifest "$candidate_id" "quota_exhausted" "" "$cv_score" "$last_public_metrics_timestamp" "$last_submission_id"
+    queue_pending_candidate "$candidate_id" "$CURRENT_SUBMISSION_COUNT"
+  fi
+  persist_state "$public_rank" "$public_score" "$CURRENT_SUBMISSION_COUNT" "$last_submission_path" "$last_public_metrics_timestamp" "$last_submission_id" "$candidate_id"
 
   echo "INFO submission_budget_reached=1"
   echo "INFO submission_window=closed"
   echo "INFO submission_count=${CURRENT_SUBMISSION_COUNT}/${MAX_DAILY_SUBMISSIONS}"
   echo "INFO continue_mode=local_only"
-  echo "INFO queued_candidate=${PENDING_SUBMISSION_QUEUE}"
+  echo "INFO queued_candidate=${candidate_id:-none}"
+  echo "INFO queue_file=${PENDING_SUBMISSION_QUEUE}"
 
   emit_local_metrics "$CURRENT_SUBMISSION_COUNT"
 }
 
-submit_mode() {
-  require_cmd kaggle
-  require_kaggle_auth
-  verify_competition_access
-  if submission_budget_reached; then
-    handle_submission_budget_pause
-    return 0
-  fi
+finalize_submission_result() {
+  local candidate_id="$1"
+  local submission_path="$2"
+  local cv_score="$3"
 
-  kaggle kernels push -p "$ROOT_DIR"
-  wait_for_kernel
-
-  local kernel_submission
-  kernel_submission="$(download_kernel_output)"
-
-  local cv_score
-  cv_score="$(read_metrics_value "cv_score" "0")"
-  submit_to_competition "$kernel_submission" "$cv_score"
   sleep "$POST_SUBMIT_SLEEP_SECONDS"
 
   local submissions_csv="outputs/submissions-after.csv"
@@ -586,32 +862,209 @@ submit_mode() {
   public_metrics="$(extract_public_metrics "$leaderboard_csv" "$submissions_csv")"
   local public_rank
   local public_score
+  local submission_count
+  local submission_id
+  local public_metrics_timestamp
   public_rank="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["public_rank"])' <<<"$public_metrics")"
   public_score="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["public_score"])' <<<"$public_metrics")"
-  local submission_count
   submission_count="$(count_recent_submissions "$submissions_csv")"
+  submission_id="$(extract_latest_submission_id "$submissions_csv")"
+  public_metrics_timestamp="$(date +%s)"
 
-  persist_state "$public_rank" "$public_score" "$submission_count" "$kernel_submission"
+  persist_state "$public_rank" "$public_score" "$submission_count" "$submission_path" "$public_metrics_timestamp" "$submission_id" "$candidate_id"
+  write_candidate_manifest "$candidate_id" "public_scored" "" "$cv_score" "$public_metrics_timestamp" "$submission_id"
+  remove_queued_candidate "$candidate_id"
 
   emit_metric "public_rank" "$public_rank"
   emit_metric "public_score" "$public_score"
   emit_metric "cv_score" "$cv_score"
   emit_metric "submission_count" "$submission_count"
+  echo "INFO candidate_id=${candidate_id}"
+  echo "INFO submission_id=${submission_id}"
+}
+
+local_only_mode() {
+  local candidate_id="$1"
+  run_local_pipeline
+  local cv_score
+  cv_score="$(read_metrics_value "cv_score" "0")"
+  write_candidate_manifest "$candidate_id" "local_only" "" "$cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" "$(read_state_value "last_submission_id" "")"
+  echo "INFO candidate_id=${candidate_id}"
+  emit_local_metrics
+}
+
+submit_stored_candidate() {
+  local candidate_id="$1"
+  local submission_path
+  local cv_score
+  submission_path="$(candidate_submission_file "$candidate_id")"
+  [[ -f "$submission_path" ]] || die "Stored candidate artifact missing for ${candidate_id}: ${submission_path}"
+  cv_score="$(candidate_metric_value "$candidate_id" "cv_score" "0")"
+  submit_to_competition "$submission_path" "$cv_score"
+  finalize_submission_result "$candidate_id" "$submission_path" "$cv_score"
+}
+
+submit_mode() {
+  local candidate_id="${1:-}"
+  require_cmd kaggle
+  require_kaggle_auth
+  verify_competition_access
+  if submission_budget_reached; then
+    if [[ -z "$candidate_id" ]]; then
+      candidate_id="$(select_best_pending_candidate)"
+    fi
+    if [[ -z "$candidate_id" ]]; then
+      candidate_id="$(resolve_candidate_id "${CANDIDATE_ID:-}")"
+      run_local_pipeline
+      local queued_cv_score
+      queued_cv_score="$(read_metrics_value "cv_score" "0")"
+      write_candidate_manifest "$candidate_id" "quota_exhausted" "" "$queued_cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" "$(read_state_value "last_submission_id" "")"
+    fi
+    handle_submission_budget_pause "$candidate_id"
+    return 0
+  fi
+
+  if [[ -z "$candidate_id" ]]; then
+    candidate_id="$(select_best_pending_candidate)"
+  fi
+
+  if [[ -n "$candidate_id" ]]; then
+    submit_stored_candidate "$candidate_id"
+    return 0
+  fi
+
+  candidate_id="$(resolve_candidate_id "${CANDIDATE_ID:-}")"
+  run_local_pipeline
+  local cv_score
+  cv_score="$(read_metrics_value "cv_score" "0")"
+  write_candidate_manifest "$candidate_id" "pending_submission" "" "$cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" "$(read_state_value "last_submission_id" "")"
+
+  kaggle kernels push -p "$ROOT_DIR"
+  wait_for_kernel
+
+  local kernel_submission
+  kernel_submission="$(download_kernel_output)"
+
+  submit_to_competition "$kernel_submission" "$cv_score"
+  finalize_submission_result "$candidate_id" "$kernel_submission" "$cv_score"
+}
+
+merge_candidates_mode() {
+  local merge_inputs="$1"
+  local candidate_id
+  candidate_id="$(resolve_candidate_id "${CANDIDATE_ID:-merge-${merge_inputs//,/--}}")"
+
+  python3 - "$CANDIDATES_DIR" "$merge_inputs" "$SUBMISSION_FILE" "$METRICS_FILE" "$CV_DIRECTION" <<'PY'
+import csv
+import json
+import math
+import shutil
+import sys
+from pathlib import Path
+
+candidate_root = Path(sys.argv[1])
+merge_inputs = [item for item in sys.argv[2].split(",") if item]
+submission_path = Path(sys.argv[3])
+metrics_path = Path(sys.argv[4])
+cv_direction = (sys.argv[5] or "higher").strip().lower()
+
+if len(merge_inputs) < 2:
+    raise SystemExit("Need at least two candidate IDs to merge.")
+
+manifests = []
+for candidate_id in merge_inputs:
+    manifest_path = candidate_root / candidate_id / "manifest.json"
+    if not manifest_path.exists():
+        raise SystemExit(f"Missing candidate manifest: {manifest_path}")
+    manifests.append(json.loads(manifest_path.read_text()))
+
+submission_files = [Path(manifest["submission_file"]) for manifest in manifests]
+for candidate in submission_files:
+    if not candidate.exists():
+        raise SystemExit(f"Missing submission file for merge: {candidate}")
+
+rows_per_file = []
+headers = None
+for submission_file in submission_files:
+    rows = list(csv.DictReader(submission_file.open(newline="")))
+    if not rows:
+        raise SystemExit(f"Submission file was empty: {submission_file}")
+    if headers is None:
+        headers = list(rows[0].keys())
+    elif headers != list(rows[0].keys()):
+        raise SystemExit("Submission files have mismatched schemas and cannot be merged safely.")
+    rows_per_file.append(rows)
+
+id_key = headers[0]
+target_keys = headers[1:]
+if not target_keys:
+    raise SystemExit("Submission merge requires at least one prediction column.")
+
+numeric = True
+for rows in rows_per_file:
+    for row in rows:
+        for key in target_keys:
+            try:
+                float(row[key])
+            except Exception:
+                numeric = False
+                break
+        if not numeric:
+            break
+    if not numeric:
+        break
+
+submission_path.parent.mkdir(parents=True, exist_ok=True)
+if not numeric:
+    shutil.copyfile(submission_files[0], submission_path)
+else:
+    with submission_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=headers)
+        writer.writeheader()
+        for row_idx in range(len(rows_per_file[0])):
+            merged = {id_key: rows_per_file[0][row_idx][id_key]}
+            for key in target_keys:
+                values = [float(rows[row_idx][key]) for rows in rows_per_file]
+                merged[key] = f"{sum(values) / len(values):.10f}"
+            writer.writerow(merged)
+
+best_manifest = max(
+    manifests,
+    key=lambda manifest: manifest.get("metrics", {}).get("cv_score", float("-inf"))
+    if cv_direction == "higher"
+    else -manifest.get("metrics", {}).get("cv_score", float("inf")),
+)
+metrics = dict(best_manifest.get("metrics") or {})
+metrics["merge_candidate_count"] = len(merge_inputs)
+metrics_path.parent.mkdir(parents=True, exist_ok=True)
+metrics_path.write_text(json.dumps(metrics, indent=2) + "\n")
+PY
+
+  write_candidate_manifest "$candidate_id" "local_only" "$merge_inputs" "$(read_metrics_value "cv_score" "0")" "$(read_state_value "last_public_metrics_timestamp" "0")" "$(read_state_value "last_submission_id" "")"
+  echo "INFO merged_candidate_id=${candidate_id}"
+  emit_local_metrics
 }
 
 load_env_file_if_present
 resolve_leaderboard_team_name
 ensure_state_file
-run_local_pipeline
 
 case "$MODE" in
   --local-only)
-    emit_local_metrics
+    local_only_mode "$(resolve_candidate_id "${MODE_ARG:-${CANDIDATE_ID:-}}")"
     ;;
   --submit)
-    submit_mode
+    submit_mode ""
+    ;;
+  --submit-candidate)
+    [[ -n "$MODE_ARG" ]] || die "--submit-candidate requires a candidate ID."
+    submit_mode "$(normalize_candidate_id "$MODE_ARG")"
+    ;;
+  --merge-candidates)
+    [[ -n "$MODE_ARG" ]] || die "--merge-candidates requires a comma-separated candidate ID list."
+    merge_candidates_mode "$MODE_ARG"
     ;;
   *)
-    die "Unsupported mode: $MODE. Use --local-only or --submit."
+    die "Unsupported mode: $MODE. Use --local-only, --submit, --submit-candidate, or --merge-candidates."
     ;;
 esac

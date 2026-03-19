@@ -45,6 +45,8 @@ This repo is built around three persistent artifacts:
 - `autoresearch.jsonl`
   - append-only run history
   - metrics, status, commit, and description for every iteration
+- `autoresearch.orchestrator.json`
+  - shared live state for lanes, candidates, pending submissions, and score freshness
 - `autoresearch.md`
   - living session memory
   - objective, constraints, what has been tried, dead ends, and next ideas
@@ -53,6 +55,13 @@ This repo is built around three persistent artifacts:
   - the thing that actually runs and emits metrics
 
 That gives you an optimization loop that survives restarts, context resets, and long autonomous sessions.
+
+Parallel orchestration is now lane-based:
+
+- `exploit` iterates on the best scored line
+- `explore` pursues a materially different hypothesis
+- `merge` builds artifact-level combinations from ready candidates
+- If `pi` is not available on `PATH`, the extension degrades honestly to coordinator-only mode instead of pretending background workers exist
 
 ## What's Included
 
@@ -192,6 +201,7 @@ The generated Kaggle workbench usually includes:
 | File | Purpose |
 |---|---|
 | `autoresearch.md` | competition memory, rules, leaderboard history, ideas |
+| `autoresearch.orchestrator.json` | shared lane state, candidate registry, freshness gates |
 | `autoresearch.sh` | local run + submit workflow |
 | `autoresearch.checks.sh` | schema, rules, packaging, and guardrail checks |
 | `notebook.py` | editable source-of-truth notebook script |
@@ -240,6 +250,34 @@ The generated notebook and scripts also treat notebook runtime as a hard gate:
 - the notebook records wall-clock runtime
 - local preflight rejects candidates that exceed the runtime budget
 - the agent is expected to keep a safety margin instead of aiming at the hard cap
+
+### Candidate Commands
+
+- `./autoresearch.sh --local-only <candidate-id>` builds a candidate locally and refreshes `outputs/candidates/<candidate-id>/manifest.json`
+- `./autoresearch.sh --submit-candidate <candidate-id>` submits a previously built candidate deterministically
+- `./autoresearch.sh --merge-candidates <candidate-a,candidate-b,...>` creates an artifact-level merge candidate before any code-level promotion
+
+### Config
+
+`autoresearch.config.json` can now separate mutable state from the repo worktree and tune freshness policies:
+
+```json
+{
+  "workingDir": ".",
+  "stateDir": ".",
+  "parallelism": {
+    "enabled": true,
+    "maxWorkers": 2,
+    "workerBackend": "auto",
+    "worktreeRoot": ".autoresearch/worktrees"
+  },
+  "policy": {
+    "maxLocalKeepsWithoutScore": 3,
+    "maxMinutesWithoutFreshScore": 90,
+    "maxNonImprovingRunsPerLane": 2
+  }
+}
+```
 
 ### Local GPU Use
 

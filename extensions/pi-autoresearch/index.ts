@@ -24,43 +24,34 @@ import { Text, truncateToWidth, matchesKey } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-interface ExperimentResult {
-  commit: string;
-  metric: number;
-  /** Additional tracked metrics: { name: value } */
-  metrics: Record<string, number>;
-  status: "keep" | "discard" | "crash" | "checks_failed";
-  description: string;
-  timestamp: number;
-  /** Segment index — increments on each config header. Current segment = highest. */
-  segment: number;
-}
-
-interface MetricDef {
-  name: string;
-  unit: string;
-}
-
-interface ExperimentState {
-  results: ExperimentResult[];
-  /** Baseline primary metric (from first experiment in current segment) */
-  bestMetric: number | null;
-  bestDirection: "lower" | "higher";
-  metricName: string;
-  metricUnit: string;
-  /** Definitions for secondary metrics (order preserved) */
-  secondaryMetrics: MetricDef[];
-  name: string | null;
-  /** Current segment index (incremented on each init_experiment) */
-  currentSegment: number;
-  /** Maximum number of experiments before auto-stopping. null = unlimited. */
-  maxExperiments: number | null;
-}
+import {
+  applyExperimentToOrchestrator,
+  buildBranchPrefix,
+  clearLaneRunning,
+  cloneExperimentState,
+  createExperimentState,
+  createOrchestratorState,
+  currentResults,
+  findBaselineMetric,
+  findBaselineRunNumber,
+  findBaselineSecondary,
+  getRunBlockReason,
+  looksLikeSubmissionCommand,
+  markLaneRunning,
+  metricUnitFromName,
+  resolveAutoresearchConfig,
+  resolveWorkerBackend,
+  restoreExperimentStateFromJsonl,
+  type ActionType,
+  type AutoresearchConfig,
+  type ExperimentResult,
+  type ExperimentState,
+  type MetricDef,
+  type OrchestratorState,
+  type ResolvedAutoresearchConfig,
+  type ScoreState,
+} from "./orchestration";
+import { ensureLaneWorktree } from "./worktrees";
 
 interface RunDetails {
   command: string;
@@ -75,11 +66,16 @@ interface RunDetails {
   checksTimedOut: boolean;
   checksOutput: string;
   checksDuration: number;
+  laneId?: string;
+  strategyId?: string;
+  candidateId?: string;
+  resolvedWorkDir?: string;
 }
 
 interface LogDetails {
   experiment: ExperimentResult;
   state: ExperimentState;
+  orchestrator?: OrchestratorState;
 }
 
 interface AutoresearchRuntime {
@@ -89,8 +85,17 @@ interface AutoresearchRuntime {
   experimentsThisSession: number;
   autoResumeTurns: number;
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
-  runningExperiment: { startedAt: number; command: string } | null;
+  runningExperiment: {
+    startedAt: number;
+    command: string;
+    laneId?: string;
+    strategyId?: string;
+    candidateId?: string;
+    workDir?: string;
+  } | null;
   state: ExperimentState;
+  orchestrator: OrchestratorState | null;
+  settings: ResolvedAutoresearchConfig | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +107,24 @@ const RunParams = Type.Object({
     description:
       "Shell command to run (e.g. 'pnpm test:vitest', 'uv run train.py')",
   }),
+  lane_id: Type.Optional(
+    Type.String({
+      description:
+        "Logical lane ID for this run. Use exploit, explore, or merge when parallel orchestration is active.",
+    })
+  ),
+  strategy_id: Type.Optional(
+    Type.String({
+      description:
+        "Stable strategy identifier for this lane. Change it when rotating to a materially different hypothesis.",
+    })
+  ),
+  candidate_id: Type.Optional(
+    Type.String({
+      description:
+        "Candidate identifier for the artifact or branch line this run is evaluating.",
+    })
+  ),
   timeout_seconds: Type.Optional(
     Type.Number({
       description: "Kill after this many seconds (default: 600)",
@@ -148,6 +171,57 @@ const LogParams = Type.Object({
   description: Type.String({
     description: "Short description of what this experiment tried",
   }),
+  lane_id: Type.Optional(
+    Type.String({
+      description:
+        "Logical lane that owned this experiment. Use exploit, explore, or merge when parallel orchestration is active.",
+    })
+  ),
+  strategy_id: Type.Optional(
+    Type.String({
+      description:
+        "Stable strategy identifier for this lane. Change it when rotating to a new hypothesis.",
+    })
+  ),
+  candidate_id: Type.Optional(
+    Type.String({
+      description:
+        "Candidate identifier for the artifact or branch line this experiment produced or evaluated.",
+    })
+  ),
+  action_type: Type.Optional(
+    StringEnum([
+      "experiment",
+      "baseline",
+      "local_only",
+      "submit",
+      "merge",
+      "promote",
+      "refresh",
+    ] as const)
+  ),
+  score_state: Type.Optional(
+    StringEnum([
+      "unknown",
+      "local_only",
+      "pending_submission",
+      "public_scored",
+      "provisional",
+      "quota_exhausted",
+    ] as const)
+  ),
+  provisional: Type.Optional(
+    Type.Boolean({
+      description:
+        "Whether this keep is provisional pending a real public score refresh.",
+    })
+  ),
+  public_metrics_timestamp: Type.Optional(
+    Type.Number({
+      description:
+        "Unix epoch milliseconds for the public metrics this result is anchored to, if known.",
+    })
+  ),
   metrics: Type.Optional(
     Type.Record(Type.String(), Type.Number(), {
       description:
@@ -203,14 +277,18 @@ function isBetter(
   return direction === "lower" ? current < best : current > best;
 }
 
-/** Get results in the current segment only */
-function currentResults(results: ExperimentResult[], segment: number): ExperimentResult[] {
-  return results.filter((r) => r.segment === segment);
-}
-
-interface AutoresearchConfig {
-  maxIterations?: number;
-  workingDir?: string;
+interface SessionPaths {
+  settings: ResolvedAutoresearchConfig;
+  workDir: string;
+  stateDir: string;
+  jsonlPath: string;
+  orchestratorPath: string;
+  mdPath: string;
+  ideasPath: string;
+  checksPath: string;
+  candidatesDir: string;
+  worktreeRoot: string;
+  lanesDir: string;
 }
 
 /** Read autoresearch.config.json from the given directory (always ctx.cwd) */
@@ -218,40 +296,56 @@ function readConfig(cwd: string): AutoresearchConfig {
   try {
     const configPath = path.join(cwd, "autoresearch.config.json");
     if (!fs.existsSync(configPath)) return {};
-    return JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    return JSON.parse(fs.readFileSync(configPath, "utf-8")) as AutoresearchConfig;
   } catch {
     return {};
   }
 }
 
-/** Read maxExperiments from autoresearch.config.json (if it exists) */
-function readMaxExperiments(cwd: string): number | null {
-  const config = readConfig(cwd);
-  return (typeof config.maxIterations === "number" && config.maxIterations > 0)
-    ? Math.floor(config.maxIterations)
-    : null;
+function hasExecutableInPath(executable: string): boolean {
+  const pathValue = process.env.PATH;
+  if (!pathValue) return false;
+  const suffixes = process.platform === "win32" ? [".exe", ".cmd", ".bat", ""] : [""];
+  for (const dir of pathValue.split(path.delimiter)) {
+    if (!dir) continue;
+    for (const suffix of suffixes) {
+      const candidate = path.join(dir, `${executable}${suffix}`);
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return true;
+      } catch {
+        // Keep searching.
+      }
+    }
+  }
+  return false;
 }
 
-/**
- * Resolve the effective working directory.
- * Reads workingDir from autoresearch.config.json in ctxCwd.
- * Returns ctxCwd if not set. Supports relative (resolved against ctxCwd) and absolute paths.
- */
-function resolveWorkDir(ctxCwd: string): string {
-  const config = readConfig(ctxCwd);
-  if (!config.workingDir) return ctxCwd;
-  return path.isAbsolute(config.workingDir)
-    ? config.workingDir
-    : path.resolve(ctxCwd, config.workingDir);
+function pickSharedFile(stateDir: string, workDir: string, filename: string): string {
+  const statePath = path.join(stateDir, filename);
+  if (fs.existsSync(statePath)) return statePath;
+  return path.join(workDir, filename);
 }
 
-/**
- * Validate that the resolved working directory exists.
- * Returns an error message if it doesn't exist, or null if OK.
- */
+function getSessionPaths(ctxCwd: string): SessionPaths {
+  const settings = resolveAutoresearchConfig(ctxCwd, readConfig(ctxCwd));
+  return {
+    settings,
+    workDir: settings.workingDir,
+    stateDir: settings.stateDir,
+    jsonlPath: path.join(settings.stateDir, "autoresearch.jsonl"),
+    orchestratorPath: path.join(settings.stateDir, "autoresearch.orchestrator.json"),
+    mdPath: pickSharedFile(settings.stateDir, settings.workingDir, "autoresearch.md"),
+    ideasPath: pickSharedFile(settings.stateDir, settings.workingDir, "autoresearch.ideas.md"),
+    checksPath: path.join(settings.workingDir, "autoresearch.checks.sh"),
+    candidatesDir: path.join(settings.stateDir, "outputs", "candidates"),
+    worktreeRoot: settings.parallelism.worktreeRoot,
+    lanesDir: path.join(settings.stateDir, "lanes"),
+  };
+}
+
 function validateWorkDir(ctxCwd: string): string | null {
-  const workDir = resolveWorkDir(ctxCwd);
-  if (workDir === ctxCwd) return null;
+  const { workDir } = getSessionPaths(ctxCwd);
   try {
     const stat = fs.statSync(workDir);
     if (!stat.isDirectory()) {
@@ -263,73 +357,53 @@ function validateWorkDir(ctxCwd: string): string | null {
   return null;
 }
 
-/** Baseline = first experiment in current segment */
-function findBaselineMetric(results: ExperimentResult[], segment: number): number | null {
-  const cur = currentResults(results, segment);
-  return cur.length > 0 ? cur[0].metric : null;
+function ensureStateDirs(paths: SessionPaths): void {
+  fs.mkdirSync(paths.stateDir, { recursive: true });
+  fs.mkdirSync(paths.worktreeRoot, { recursive: true });
+  fs.mkdirSync(paths.candidatesDir, { recursive: true });
+  fs.mkdirSync(paths.lanesDir, { recursive: true });
 }
 
-function findBaselineRunNumber(results: ExperimentResult[], segment: number): number | null {
-  const index = results.findIndex((result) => result.segment === segment);
-  return index >= 0 ? index + 1 : null;
-}
-
-/**
- * Find secondary metric baselines from the first experiment in current segment.
- * For metrics that didn't exist at baseline time, falls back to the first
- * occurrence of that metric in the current segment.
- */
-function findBaselineSecondary(
-  results: ExperimentResult[],
-  segment: number,
-  knownMetrics?: MetricDef[]
-): Record<string, number> {
-  const cur = currentResults(results, segment);
-  const base: Record<string, number> = cur.length > 0
-    ? { ...(cur[0].metrics ?? {}) }
-    : {};
-
-  // Fill in any known metrics missing from baseline with their first occurrence
-  if (knownMetrics) {
-    for (const sm of knownMetrics) {
-      if (base[sm.name] === undefined) {
-        for (const r of cur) {
-          const val = (r.metrics ?? {})[sm.name];
-          if (val !== undefined) {
-            base[sm.name] = val;
-            break;
-          }
-        }
-      }
+function readOrchestrator(paths: SessionPaths, state: ExperimentState): OrchestratorState {
+  ensureStateDirs(paths);
+  const backend = resolveWorkerBackend(
+    paths.settings.parallelism.workerBackend,
+    hasExecutableInPath("pi")
+  );
+  const branchPrefix = buildBranchPrefix(state.name, paths.workDir);
+  let existing: Partial<OrchestratorState> | null = null;
+  if (fs.existsSync(paths.orchestratorPath)) {
+    try {
+      existing = JSON.parse(fs.readFileSync(paths.orchestratorPath, "utf-8")) as OrchestratorState;
+    } catch {
+      existing = null;
     }
   }
-
-  return base;
+  const orchestrator = createOrchestratorState({
+    workDir: paths.workDir,
+    stateDir: paths.stateDir,
+    worktreeRoot: paths.worktreeRoot,
+    branchPrefix,
+    settings: paths.settings,
+    backend,
+    existing,
+  });
+  for (const lane of Object.values(orchestrator.lanes)) {
+    fs.mkdirSync(path.dirname(lane.notesPath), { recursive: true });
+    if (!fs.existsSync(lane.notesPath)) {
+      fs.writeFileSync(
+        lane.notesPath,
+        `# ${lane.id} lane notes\n\nTrack lane-local observations here.\n`
+      );
+    }
+  }
+  fs.writeFileSync(paths.orchestratorPath, JSON.stringify(orchestrator, null, 2) + "\n");
+  return orchestrator;
 }
 
-function cloneExperimentState(state: ExperimentState): ExperimentState {
-  return {
-    ...state,
-    results: state.results.map((result) => ({
-      ...result,
-      metrics: { ...result.metrics },
-    })),
-    secondaryMetrics: state.secondaryMetrics.map((metric) => ({ ...metric })),
-  };
-}
-
-function createExperimentState(): ExperimentState {
-  return {
-    results: [],
-    bestMetric: null,
-    bestDirection: "lower",
-    metricName: "metric",
-    metricUnit: "",
-    secondaryMetrics: [],
-    name: null,
-    currentSegment: 0,
-    maxExperiments: null,
-  };
+function writeOrchestrator(paths: SessionPaths, orchestrator: OrchestratorState): void {
+  ensureStateDirs(paths);
+  fs.writeFileSync(paths.orchestratorPath, JSON.stringify(orchestrator, null, 2) + "\n");
 }
 
 function createSessionRuntime(): AutoresearchRuntime {
@@ -342,6 +416,8 @@ function createSessionRuntime(): AutoresearchRuntime {
     lastRunChecks: null,
     runningExperiment: null,
     state: createExperimentState(),
+    orchestrator: null,
+    settings: null,
   };
 }
 
@@ -374,6 +450,7 @@ function createRuntimeStore() {
 
 function renderDashboardLines(
   st: ExperimentState,
+  orchestrator: OrchestratorState | null,
   width: number,
   th: Theme,
   maxRows: number = 6
@@ -422,6 +499,51 @@ function renderDashboardLines(
       width
     )
   );
+
+  if (orchestrator) {
+    lines.push(
+      truncateToWidth(
+        `  ${th.fg("muted", "Backend:")} ` +
+          (orchestrator.backend.available
+            ? th.fg("success", orchestrator.backend.resolved)
+            : th.fg("warning", `${orchestrator.backend.resolved} degraded`)) +
+          (orchestrator.backend.degradedReason
+            ? th.fg("dim", `  ${orchestrator.backend.degradedReason}`)
+            : ""),
+        width
+      )
+    );
+    if (orchestrator.policy.forcedSubmitRequired) {
+      lines.push(
+        truncateToWidth(
+          `  ${th.fg("warning", "Submission Gate:")} ${th.fg("text", orchestrator.policy.forcedSubmitReason ?? "Fresh public score required.")}`,
+          width
+        )
+      );
+    }
+    for (const lane of Object.values(orchestrator.lanes)) {
+      const candidateText = lane.currentCandidateId ? ` candidate=${lane.currentCandidateId}` : "";
+      const strategyText = lane.currentStrategyId ? ` strategy=${lane.currentStrategyId}` : "";
+      const streakText =
+        lane.consecutiveNonImprovingRuns > 0
+          ? ` streak=${lane.consecutiveNonImprovingRuns}`
+          : "";
+      const statusColor =
+        lane.status === "ready"
+          ? "success"
+          : lane.status === "yield_required"
+            ? "warning"
+            : lane.status === "degraded"
+              ? "error"
+              : "muted";
+      lines.push(
+        truncateToWidth(
+          `  ${th.fg("muted", `${lane.id}:`)} ${th.fg(statusColor, lane.status)}${th.fg("dim", `${strategyText}${candidateText}${streakText}`)}`,
+          width
+        )
+      );
+    }
+  }
 
   // Baseline: first run's primary metric
   const baselineSuffix = baselineRunNumber === null ? "" : ` #${baselineRunNumber}`;
@@ -622,6 +744,160 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const getSessionKey = (ctx: ExtensionContext) => ctx.sessionManager.getSessionId();
   const getRuntime = (ctx: ExtensionContext): AutoresearchRuntime =>
     runtimeStore.ensure(getSessionKey(ctx));
+  const loadSessionState = (ctx: ExtensionContext) => {
+    const runtime = getRuntime(ctx);
+    const paths = getSessionPaths(ctx.cwd);
+    runtime.settings = paths.settings;
+    runtime.orchestrator = readOrchestrator(paths, runtime.state);
+    return { runtime, paths };
+  };
+
+  const ensureLaneWorkspace = (
+    paths: SessionPaths,
+    orchestrator: OrchestratorState,
+    laneId: string,
+    experimentName: string | null
+  ): string => {
+    const lane = orchestrator.lanes[laneId];
+    if (!lane) {
+      throw new Error(`Unknown lane: ${laneId}`);
+    }
+    const result = ensureLaneWorktree({
+      repoDir: paths.workDir,
+      worktreePath: lane.worktreePath,
+      laneId,
+      branchPrefix: buildBranchPrefix(experimentName, paths.workDir),
+    });
+    lane.branchName = result.branchName;
+    lane.worktreePath = result.worktreePath;
+    writeOrchestrator(paths, orchestrator);
+    return lane.worktreePath;
+  };
+
+  const resolveActionType = (params: Record<string, unknown>): ActionType =>
+    (params.action_type as ActionType | undefined) ?? "experiment";
+
+  const resolveScoreState = (params: Record<string, unknown>): ScoreState => {
+    const explicit = params.score_state as ScoreState | undefined;
+    if (explicit) return explicit;
+    if (params.provisional === true) return "provisional";
+    if (params.action_type === "submit") return "public_scored";
+    if (params.action_type === "local_only") return "local_only";
+    return "unknown";
+  };
+
+  const makeCandidateId = (
+    laneId: string | undefined,
+    strategyId: string | undefined,
+    timestamp: number
+  ) => {
+    const lane = (laneId ?? "candidate").replace(/[^a-zA-Z0-9_-]+/g, "-");
+    const strategy = (strategyId ?? "run").replace(/[^a-zA-Z0-9_-]+/g, "-");
+    return `${lane}-${strategy}-${timestamp}`;
+  };
+
+  const collectArtifactPaths = (workDir: string): string[] => {
+    const results: string[] = [];
+    const preferred = [
+      "outputs/metrics.json",
+      "outputs/pending_submission_queue.jsonl",
+      "outputs/local-run.log",
+      "submission.csv",
+      "submission.parquet",
+    ];
+    for (const relative of preferred) {
+      const absolute = path.join(workDir, relative);
+      if (fs.existsSync(absolute)) results.push(absolute);
+    }
+    const outputsDir = path.join(workDir, "outputs");
+    if (fs.existsSync(outputsDir)) {
+      for (const entry of fs.readdirSync(outputsDir, { withFileTypes: true })) {
+        if (!entry.isFile()) continue;
+        const lower = entry.name.toLowerCase();
+        if (
+          lower.includes("submission") ||
+          lower.includes("prediction") ||
+          lower.includes("candidate") ||
+          lower.includes("pool") ||
+          lower === "metrics.json"
+        ) {
+          results.push(path.join(outputsDir, entry.name));
+        }
+      }
+    }
+    return [...new Set(results)];
+  };
+
+  const writeCandidateManifest = (args: {
+    paths: SessionPaths;
+    candidateId: string;
+    laneId?: string;
+    strategyId?: string;
+    experiment: ExperimentResult;
+    workDir: string;
+    artifactPaths: string[];
+  }) => {
+    const candidateDir = path.join(args.paths.candidatesDir, args.candidateId);
+    fs.mkdirSync(candidateDir, { recursive: true });
+    const manifest = {
+      candidate_id: args.candidateId,
+      lane_id: args.laneId ?? null,
+      strategy_id: args.strategyId ?? null,
+      commit: args.experiment.commit,
+      metric: args.experiment.metric,
+      metrics: args.experiment.metrics,
+      status: args.experiment.status,
+      description: args.experiment.description,
+      action_type: args.experiment.actionType ?? null,
+      score_state: args.experiment.scoreState ?? null,
+      provisional: args.experiment.provisional ?? false,
+      public_metrics_timestamp: args.experiment.publicMetricsTimestamp ?? null,
+      worktree_path: args.workDir,
+      artifact_dir: candidateDir,
+      artifact_paths: args.artifactPaths,
+      lineage:
+        args.experiment.candidateId && args.experiment.candidateId !== args.candidateId
+          ? [args.experiment.candidateId]
+          : [],
+      updated_at: args.experiment.timestamp,
+    };
+    fs.writeFileSync(
+      path.join(candidateDir, "manifest.json"),
+      JSON.stringify(manifest, null, 2) + "\n"
+    );
+  };
+
+  const buildProtectedRelativePaths = (paths: SessionPaths, cwd: string): string[] => {
+    const candidatesDir = path.relative(cwd, paths.candidatesDir);
+    const lanesDir = path.relative(cwd, paths.lanesDir);
+    const shared = [
+      path.relative(cwd, paths.jsonlPath),
+      path.relative(cwd, paths.orchestratorPath),
+      path.relative(cwd, paths.mdPath),
+      path.relative(cwd, paths.ideasPath),
+      "autoresearch.sh",
+      "autoresearch.checks.sh",
+      candidatesDir,
+      lanesDir,
+    ];
+    return [...new Set(shared.filter((entry) => entry && !entry.startsWith("..")))];
+  };
+
+  const buildRevertCommand = (protectedPaths: string[]): string => {
+    const stageable = protectedPaths.filter(
+      (entry) =>
+        !entry.includes("outputs/candidates") &&
+        !entry.includes("/lanes") &&
+        !entry.startsWith("lanes")
+    );
+    const protectedAdds = stageable
+      .map((entry) => `git add -- "${entry}" 2>/dev/null || true`)
+      .join("; ");
+    const cleanExcludes = protectedPaths
+      .map((entry) => `-e "${entry}"`)
+      .join(" ");
+    return `${protectedAdds}; git checkout -- .; git clean -fd ${cleanExcludes}`;
+  };
 
   // Running experiment state (for spinner in fullscreen overlay)
   let overlayTui: { requestRender: () => void } | null = null;
@@ -650,7 +926,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "",
       "<text> enters autoresearch mode and starts or resumes the loop.",
       "off leaves autoresearch mode.",
-      "clear deletes autoresearch.jsonl and turns autoresearch mode off.",
+      "clear deletes autoresearch.jsonl and autoresearch.orchestrator.json, then turns autoresearch mode off.",
       "",
       "Examples:",
       "  /autoresearch optimize unit test runtime, monitor correctness",
@@ -670,65 +946,21 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     runtime.experimentsThisSession = 0;
     runtime.autoResumeTurns = 0;
     runtime.state = createExperimentState();
+    runtime.orchestrator = null;
+    runtime.settings = null;
 
     let state = runtime.state;
-
-    // Resolve effective working directory (config stays in ctx.cwd, files in workDir)
-    const workDir = resolveWorkDir(ctx.cwd);
-
-    // Primary: read from autoresearch.jsonl (alongside autoresearch.md/sh)
-    const jsonlPath = path.join(workDir, "autoresearch.jsonl");
+    const paths = getSessionPaths(ctx.cwd);
+    runtime.settings = paths.settings;
     let loadedFromJsonl = false;
     try {
-      if (fs.existsSync(jsonlPath)) {
-        let segment = 0;
-        const lines = fs.readFileSync(jsonlPath, "utf-8").trim().split("\n").filter(Boolean);
-        for (const line of lines) {
-          try {
-            const entry = JSON.parse(line);
-
-            // Config header line — each header starts a new segment
-            if (entry.type === "config") {
-              if (entry.name) state.name = entry.name;
-              if (entry.metricName) state.metricName = entry.metricName;
-              if (entry.metricUnit !== undefined) state.metricUnit = entry.metricUnit;
-              if (entry.bestDirection) state.bestDirection = entry.bestDirection;
-              // Increment segment (first config = 0, second = 1, etc.)
-              if (state.results.length > 0) segment++;
-              state.currentSegment = segment;
-              continue;
-            }
-
-            // Experiment result line
-            state.results.push({
-              commit: entry.commit ?? "",
-              metric: entry.metric ?? 0,
-              metrics: entry.metrics ?? {},
-              status: entry.status ?? "keep",
-              description: entry.description ?? "",
-              timestamp: entry.timestamp ?? 0,
-              segment,
-            });
-
-            // Register secondary metrics
-            for (const name of Object.keys(entry.metrics ?? {})) {
-              if (!state.secondaryMetrics.find((m) => m.name === name)) {
-                let unit = "";
-                if (name.endsWith("µs")) unit = "µs";
-                else if (name.endsWith("_ms")) unit = "ms";
-                else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
-                else if (name.endsWith("_kb")) unit = "kb";
-                else if (name.endsWith("_mb")) unit = "mb";
-                state.secondaryMetrics.push({ name, unit });
-              }
-            }
-          } catch {
-            // Skip malformed lines
-          }
-        }
+      if (fs.existsSync(paths.jsonlPath)) {
+        runtime.state = restoreExperimentStateFromJsonl(
+          fs.readFileSync(paths.jsonlPath, "utf-8")
+        );
+        state = runtime.state;
         if (state.results.length > 0) {
           loadedFromJsonl = true;
-          state.bestMetric = findBaselineMetric(state.results, state.currentSegment);
         }
       }
     } catch {
@@ -757,12 +989,11 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
     }
 
+    state.maxExperiments = paths.settings.maxIterations;
+    runtime.orchestrator = readOrchestrator(paths, state);
 
-    // Read max experiments from config file
-    state.maxExperiments = readMaxExperiments(ctx.cwd);
-
-    // Auto-enter autoresearch mode only when a persisted experiment log exists
-    runtime.autoresearchMode = fs.existsSync(path.join(workDir, "autoresearch.jsonl"));
+    runtime.autoresearchMode =
+      fs.existsSync(paths.jsonlPath) || fs.existsSync(paths.orchestratorPath);
 
     updateWidget(ctx);
   };
@@ -787,6 +1018,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
         if (state.name) {
           parts.push(theme.fg("dim", ` │ ${state.name}`));
+        }
+
+        if (runtime.orchestrator && !runtime.orchestrator.backend.available) {
+          parts.push(theme.fg("warning", " │ degraded backend"));
         }
 
         parts.push(theme.fg("dim", ` │ ${runtime.runningExperiment.command}`));
@@ -823,7 +1058,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           )
         );
 
-        lines.push(...renderDashboardLines(state, width, theme));
+        lines.push(...renderDashboardLines(state, runtime.orchestrator, width, theme));
 
         return new Text(lines.join("\n"), 0, 0);
       });
@@ -836,6 +1071,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         const checksFailed = cur.filter((r) => r.status === "checks_failed").length;
         const baseline = state.bestMetric;
         const baselineSec = findBaselineSecondary(state.results, state.currentSegment, state.secondaryMetrics);
+        const orchestrator = runtime.orchestrator;
 
         // Find best kept primary metric, its secondary values, and run number
         let bestPrimary: number | null = null;
@@ -896,6 +1132,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           parts.push(theme.fg("dim", ` │ ${state.name}`));
         }
 
+        if (orchestrator) {
+          parts.push(
+            theme.fg(
+              orchestrator.backend.available ? "muted" : "warning",
+              orchestrator.backend.available ? " │ lanes active" : " │ lanes degraded"
+            )
+          );
+          if (orchestrator.policy.forcedSubmitRequired) {
+            parts.push(theme.fg("warning", " │ submit now"));
+          }
+        }
+
         parts.push(theme.fg("dim", "  (ctrl+x expand • ctrl+shift+x fullscreen)"));
 
         return new Text(parts.join(""), 0, 0);
@@ -944,16 +1192,22 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       return;
     }
 
-    // Auto-continue: send a message to resume the loop
-    // The agent reads autoresearch.md on startup which has all context
-    const workDir = resolveWorkDir(ctx.cwd);
-    const ideasPath = path.join(workDir, "autoresearch.ideas.md");
-    const hasIdeas = fs.existsSync(ideasPath);
+    const { runtime: refreshed, paths } = loadSessionState(ctx);
+    const hasIdeas = fs.existsSync(paths.ideasPath);
+    const orchestratorNote =
+      refreshed.orchestrator && !refreshed.orchestrator.backend.available
+        ? " The worker backend is degraded, so lane work must be rotated serially unless `pi` becomes available."
+        : "";
 
     let resumeMsg = "Autoresearch loop ended (likely context limit). Resume the experiment loop — read autoresearch.md and git log for context.";
     if (hasIdeas) {
       resumeMsg += " Check autoresearch.ideas.md for promising paths to explore. Prune stale/tried ideas.";
     }
+    resumeMsg += ` Read ${paths.orchestratorPath} before choosing the next lane.`;
+    if (refreshed.orchestrator?.policy.forcedSubmitRequired) {
+      resumeMsg += ` ${refreshed.orchestrator.policy.forcedSubmitReason ?? "A scored submission is required before more local-only work."}`;
+    }
+    resumeMsg += orchestratorNote;
     resumeMsg += ` ${EVALUATION_GUARDRAIL}`;
 
     runtime.autoResumeTurns++;
@@ -963,30 +1217,44 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   // When in autoresearch mode, add a static note to the system prompt.
   // Only a short pointer — no file content, fully cache-safe.
   pi.on("before_agent_start", async (event, ctx) => {
-    const runtime = getRuntime(ctx);
+    const { runtime, paths } = loadSessionState(ctx);
     if (!runtime.autoresearchMode) return;
-
-    const workDir = resolveWorkDir(ctx.cwd);
-    const mdPath = path.join(workDir, "autoresearch.md");
-    const ideasPath = path.join(workDir, "autoresearch.ideas.md");
-    const hasIdeas = fs.existsSync(ideasPath);
-
-    const checksPath = path.join(workDir, "autoresearch.checks.sh");
-    const hasChecks = fs.existsSync(checksPath);
+    const hasIdeas = fs.existsSync(paths.ideasPath);
+    const hasChecks = fs.existsSync(paths.checksPath);
 
     let extra =
       "\n\n## Autoresearch Mode (ACTIVE)" +
       "\nYou are in autoresearch mode. Optimize the primary metric through an autonomous experiment loop." +
       "\nUse init_experiment, run_experiment, and log_experiment tools. NEVER STOP until interrupted." +
-      `\nExperiment rules: ${mdPath} — read this file at the start of every session and after compaction.` +
+      `\nExperiment rules: ${paths.mdPath} — read this file at the start of every session and after compaction.` +
+      `\nOrchestrator state: ${paths.orchestratorPath} — read this file before selecting a lane or candidate.` +
       "\nWrite promising but deferred optimizations as bullet points to autoresearch.ideas.md — don't let good ideas get lost." +
+      "\nWhen parallel orchestration is enabled, use lane_ids exploit, explore, and merge. Always pass lane_id and strategy_id to run_experiment and log_experiment when you are operating inside a lane." +
+      "\nCandidate-producing keeps should carry a candidate_id so the coordinator can compare, queue, and merge them." +
+      "\nThe merge lane is for artifact-level merges or ensembles first. Do not auto-merge code branches." +
       `\n${EVALUATION_GUARDRAIL}` +
       "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration.";
+
+    if (runtime.orchestrator) {
+      extra +=
+        `\nParallel backend: ${runtime.orchestrator.backend.resolved}` +
+        (runtime.orchestrator.backend.available
+          ? " (available)."
+          : ` (degraded). ${runtime.orchestrator.backend.degradedReason ?? ""}`);
+      extra +=
+        "\nLane notes:" +
+        Object.values(runtime.orchestrator.lanes)
+          .map((lane) => ` ${lane.id}=${lane.notesPath}`)
+          .join(",");
+      if (runtime.orchestrator.policy.forcedSubmitRequired) {
+        extra += `\nSubmission freshness gate: ${runtime.orchestrator.policy.forcedSubmitReason ?? "A fresh public score is required now."}`;
+      }
+    }
 
     if (hasChecks) {
       extra +=
         "\n\n## Backpressure Checks (ACTIVE)" +
-        `\n${checksPath} exists and runs automatically after every passing experiment command in run_experiment.` +
+        `\n${paths.checksPath} exists and runs automatically after every passing experiment command in run_experiment.` +
         "\nIf the experiment command passes but checks fail, run_experiment will report it clearly." +
         "\nUse status 'checks_failed' in log_experiment when this happens — it behaves like a crash (no commit, changes auto-reverted)." +
         "\nYou cannot use status 'keep' when checks have failed." +
@@ -994,7 +1262,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     }
 
     if (hasIdeas) {
-      extra += `\n\n💡 Ideas backlog exists at ${ideasPath} — check it for promising experiment paths. Prune stale entries.`;
+      extra += `\n\n💡 Ideas backlog exists at ${paths.ideasPath} — check it for promising experiment paths. Prune stale entries.`;
     }
 
     return {
@@ -1023,6 +1291,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
+      const { paths } = loadSessionState(ctx);
 
       // Validate working directory exists
       const workDirError = validateWorkDir(ctx.cwd);
@@ -1047,12 +1316,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       state.secondaryMetrics = [];
 
       // Read max experiments from config file (config always in ctx.cwd)
-      state.maxExperiments = readMaxExperiments(ctx.cwd);
+      state.maxExperiments = paths.settings.maxIterations;
 
       // Write config header to jsonl (append for re-init, create for first)
-      const workDir = resolveWorkDir(ctx.cwd);
       try {
-        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
         const config = JSON.stringify({
           type: "config",
           name: state.name,
@@ -1061,9 +1328,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           bestDirection: state.bestDirection,
         });
         if (isReinit) {
-          fs.appendFileSync(jsonlPath, config + "\n");
+          fs.appendFileSync(paths.jsonlPath, config + "\n");
         } else {
-          fs.writeFileSync(jsonlPath, config + "\n");
+          fs.writeFileSync(paths.jsonlPath, config + "\n");
         }
       } catch (e) {
         return {
@@ -1076,17 +1343,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       runtime.autoresearchMode = true;
+      runtime.orchestrator = readOrchestrator(paths, state);
       updateWidget(ctx);
 
       const reinitNote = isReinit ? " (re-initialized — previous results archived, new baseline needed)" : "";
       const limitNote = state.maxExperiments !== null ? `\nMax iterations: ${state.maxExperiments} (from autoresearch.config.json)` : "";
-      const workDirNote = workDir !== ctx.cwd ? `\nWorking directory: ${workDir}` : "";
+      const workDirNote = paths.workDir !== ctx.cwd ? `\nWorking directory: ${paths.workDir}` : "";
+      const stateDirNote = paths.stateDir !== paths.workDir ? `\nState directory: ${paths.stateDir}` : "";
       return {
         content: [{
           type: "text",
-          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}\nConfig written to autoresearch.jsonl. Now run the baseline with run_experiment.`,
+          text: `✅ Experiment initialized: "${state.name}"${reinitNote}\nMetric: ${state.metricName} (${state.metricUnit || "unitless"}, ${state.bestDirection} is better)${limitNote}${workDirNote}${stateDirNote}\nConfig written to ${paths.jsonlPath}. Now run the baseline with run_experiment.`,
         }],
-        details: { state: cloneExperimentState(state) },
+        details: { state: cloneExperimentState(state), orchestrator: runtime.orchestrator },
       };
     },
 
@@ -1120,8 +1389,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     parameters: RunParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const runtime = getRuntime(ctx);
+      const { runtime, paths } = loadSessionState(ctx);
       const state = runtime.state;
+      const orchestrator = runtime.orchestrator ?? readOrchestrator(paths, state);
 
       // Validate working directory exists
       const workDirError = validateWorkDir(ctx.cwd);
@@ -1131,7 +1401,6 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           details: {},
         };
       }
-      const workDir = resolveWorkDir(ctx.cwd);
 
       // Block if max experiments limit already reached
       if (state.maxExperiments !== null) {
@@ -1144,28 +1413,84 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
+      const blockReason = getRunBlockReason(
+        orchestrator,
+        params.command,
+        params.lane_id,
+        params.strategy_id
+      );
+      if (blockReason) {
+        return {
+          content: [{ type: "text", text: `🛑 ${blockReason}` }],
+          details: {},
+        };
+      }
+
+      let execWorkDir = paths.workDir;
+      if (params.lane_id && paths.settings.parallelism.enabled) {
+        try {
+          execWorkDir = ensureLaneWorkspace(
+            paths,
+            orchestrator,
+            params.lane_id,
+            state.name
+          );
+        } catch (error) {
+          return {
+            content: [{
+              type: "text",
+              text: `❌ Failed to prepare lane ${params.lane_id}: ${error instanceof Error ? error.message : String(error)}`,
+            }],
+            details: {},
+          };
+        }
+      }
+
       const timeout = (params.timeout_seconds ?? 600) * 1000;
 
-      runtime.runningExperiment = { startedAt: Date.now(), command: params.command };
+      const startedAt = Date.now();
+      runtime.runningExperiment = {
+        startedAt,
+        command: params.command,
+        laneId: params.lane_id,
+        strategyId: params.strategy_id,
+        candidateId: params.candidate_id,
+        workDir: execWorkDir,
+      };
+      markLaneRunning(orchestrator, {
+        laneId: params.lane_id ?? "",
+        strategyId: params.strategy_id,
+        candidateId: params.candidate_id,
+        timestamp: startedAt,
+      });
+      writeOrchestrator(paths, orchestrator);
       updateWidget(ctx);
       if (overlayTui) overlayTui.requestRender();
 
       onUpdate?.({
-        content: [{ type: "text", text: `Running: ${params.command}` }],
+        content: [{
+          type: "text",
+          text:
+            `Running: ${params.command}` +
+            (params.lane_id ? `\nLane: ${params.lane_id}` : "") +
+            `\nWorkdir: ${execWorkDir}`,
+        }],
         details: { phase: "running" },
       });
 
-      const t0 = Date.now();
+      const t0 = startedAt;
 
       let result;
       try {
         result = await pi.exec("bash", ["-c", params.command], {
           signal,
           timeout,
-          cwd: workDir,
+          cwd: execWorkDir,
         });
       } finally {
         runtime.runningExperiment = null;
+        clearLaneRunning(orchestrator, params.lane_id, Date.now());
+        writeOrchestrator(paths, orchestrator);
         updateWidget(ctx);
         if (overlayTui) overlayTui.requestRender();
       }
@@ -1180,7 +1505,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       let checksOutput = "";
       let checksDuration = 0;
 
-      const checksPath = path.join(workDir, "autoresearch.checks.sh");
+      const laneChecksPath = path.join(execWorkDir, "autoresearch.checks.sh");
+      const checksPath = fs.existsSync(laneChecksPath) ? laneChecksPath : paths.checksPath;
+      const checksCwd = fs.existsSync(laneChecksPath) ? execWorkDir : paths.workDir;
       if (benchmarkPassed && fs.existsSync(checksPath)) {
         const checksTimeout = (params.checks_timeout_seconds ?? 300) * 1000;
         const ct0 = Date.now();
@@ -1188,7 +1515,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           const checksResult = await pi.exec("bash", [checksPath], {
             signal,
             timeout: checksTimeout,
-            cwd: workDir,
+            cwd: checksCwd,
           });
           checksDuration = (Date.now() - ct0) / 1000;
           checksTimedOut = !!checksResult.killed;
@@ -1219,6 +1546,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         checksTimedOut,
         checksOutput: checksOutput.split("\n").slice(-80).join("\n"),
         checksDuration,
+        laneId: params.lane_id,
+        strategyId: params.strategy_id,
+        candidateId: params.candidate_id,
+        resolvedWorkDir: execWorkDir,
       };
 
       // Build LLM response
@@ -1240,6 +1571,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         if (checksPass === true) {
           text += `✅ Checks passed in ${checksDuration.toFixed(1)}s\n`;
         }
+      }
+
+      if (params.lane_id) {
+        text += `🧭 Lane: ${params.lane_id}\n`;
       }
 
       if (state.bestMetric !== null) {
@@ -1266,6 +1601,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     renderCall(args, theme) {
       let text = theme.fg("toolTitle", theme.bold("run_experiment "));
       text += theme.fg("muted", args.command);
+      if (args.lane_id) {
+        text += theme.fg("dim", ` [${args.lane_id}]`);
+      }
       if (args.timeout_seconds) {
         text += theme.fg("dim", ` (timeout: ${args.timeout_seconds}s)`);
       }
@@ -1363,8 +1701,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     parameters: LogParams,
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const runtime = getRuntime(ctx);
+      const { runtime, paths } = loadSessionState(ctx);
       const state = runtime.state;
+      const orchestrator = runtime.orchestrator ?? readOrchestrator(paths, state);
 
       // Validate working directory exists
       const workDirError = validateWorkDir(ctx.cwd);
@@ -1374,8 +1713,35 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           details: {},
         };
       }
-      const workDir = resolveWorkDir(ctx.cwd);
-      const secondaryMetrics = params.metrics ?? {};
+      const secondaryMetrics = (params.metrics ?? {}) as Record<string, number>;
+      const actionType = resolveActionType(params as Record<string, unknown>);
+      const scoreState = resolveScoreState(params as Record<string, unknown>);
+      const timestamp = Date.now();
+      const candidateId =
+        params.candidate_id ??
+        (params.status === "keep"
+          ? makeCandidateId(params.lane_id, params.strategy_id, timestamp)
+          : undefined);
+
+      let execWorkDir = paths.workDir;
+      if (params.lane_id && paths.settings.parallelism.enabled) {
+        try {
+          execWorkDir = ensureLaneWorkspace(
+            paths,
+            orchestrator,
+            params.lane_id,
+            state.name
+          );
+        } catch (error) {
+          return {
+            content: [{
+              type: "text",
+              text: `❌ Failed to prepare lane ${params.lane_id}: ${error instanceof Error ? error.message : String(error)}`,
+            }],
+            details: {},
+          };
+        }
+      }
 
       // Gate: prevent "keep" when last run's checks failed
       if (params.status === "keep" && runtime.lastRunChecks && !runtime.lastRunChecks.pass) {
@@ -1383,6 +1749,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           content: [{
             type: "text",
             text: `❌ Cannot keep — autoresearch.checks.sh failed.\n\n${runtime.lastRunChecks.output.slice(-500)}\n\nLog as 'checks_failed' instead. The primary metric is valid but correctness checks did not pass.`,
+          }],
+          details: {},
+        };
+      }
+
+      if (params.status === "keep" && scoreState === "quota_exhausted" && !params.provisional) {
+        return {
+          content: [{
+            type: "text",
+            text: "❌ Quota-exhausted local keeps must be marked provisional=true so they are not treated as fresh public progress.",
           }],
           details: {},
         };
@@ -1424,8 +1800,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         metrics: secondaryMetrics,
         status: params.status,
         description: params.description,
-        timestamp: Date.now(),
+        timestamp,
         segment: state.currentSegment,
+        laneId: params.lane_id,
+        strategyId: params.strategy_id,
+        candidateId,
+        actionType,
+        scoreState,
+        provisional: params.provisional,
+        publicMetricsTimestamp: params.public_metrics_timestamp ?? null,
       };
 
       state.results.push(experiment);
@@ -1434,13 +1817,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Register any new secondary metric names
       for (const name of Object.keys(secondaryMetrics)) {
         if (!state.secondaryMetrics.find((m) => m.name === name)) {
-          let unit = "";
-          if (name.endsWith("µs")) unit = "µs";
-          else if (name.endsWith("_ms")) unit = "ms";
-          else if (name.endsWith("_s") || name.endsWith("_sec")) unit = "s";
-          else if (name.endsWith("_kb")) unit = "kb";
-          else if (name.endsWith("_mb")) unit = "mb";
-          state.secondaryMetrics.push({ name, unit });
+          state.secondaryMetrics.push({ name, unit: metricUnitFromName(name) });
         }
       }
 
@@ -1486,6 +1863,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         text += ` / ${state.maxExperiments} max`;
       }
       text += `)`;
+      if (params.lane_id) {
+        text += `\nLane: ${params.lane_id}`;
+      }
+      if (params.strategy_id) {
+        text += ` | strategy: ${params.strategy_id}`;
+      }
+      if (candidateId) {
+        text += ` | candidate: ${candidateId}`;
+      }
+      text += `\nScore state: ${scoreState}`;
 
       // Auto-commit only on keep — discards/crashes get reverted anyway
       if (params.status === "keep") {
@@ -1494,11 +1881,16 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             status: params.status,
             [state.metricName || "metric"]: params.metric,
             ...secondaryMetrics,
+            lane_id: params.lane_id ?? null,
+            strategy_id: params.strategy_id ?? null,
+            candidate_id: candidateId ?? null,
+            action_type: actionType,
+            score_state: scoreState,
           };
           const trailerJson = JSON.stringify(resultData);
           const commitMsg = `${params.description}\n\nResult: ${trailerJson}`;
 
-          const execOpts = { cwd: workDir, timeout: 10000 };
+          const execOpts = { cwd: execWorkDir, timeout: 10000 };
           const addResult = await pi.exec("git", ["add", "-A"], execOpts);
           if (addResult.code !== 0) {
             const addErr = (addResult.stdout + addResult.stderr).trim();
@@ -1516,7 +1908,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
               text += `\n📝 Git: committed — ${firstLine}`;
 
               try {
-                const shaResult = await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: workDir, timeout: 5000 });
+                const shaResult = await pi.exec("git", ["rev-parse", "--short=7", "HEAD"], { cwd: execWorkDir, timeout: 5000 });
                 const newSha = (shaResult.stdout || "").trim();
                 if (newSha && newSha.length >= 7) {
                   experiment.commit = newSha;
@@ -1533,10 +1925,42 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         }
       }
 
+      const artifactPaths = collectArtifactPaths(execWorkDir);
+      if (params.status === "keep" && candidateId) {
+        writeCandidateManifest({
+          paths,
+          candidateId,
+          laneId: params.lane_id,
+          strategyId: params.strategy_id,
+          experiment,
+          workDir: execWorkDir,
+          artifactPaths,
+        });
+      }
+
+      applyExperimentToOrchestrator(orchestrator, {
+        laneId: params.lane_id,
+        strategyId: params.strategy_id,
+        candidateId,
+        metric: params.metric,
+        metrics: secondaryMetrics,
+        status: params.status,
+        description: params.description,
+        timestamp,
+        commit: experiment.commit,
+        actionType,
+        scoreState,
+        provisional: params.provisional,
+        publicMetricsTimestamp: params.public_metrics_timestamp ?? null,
+        artifactDir: candidateId ? path.join(paths.candidatesDir, candidateId) : null,
+        artifactPaths,
+      });
+      runtime.orchestrator = orchestrator;
+      writeOrchestrator(paths, orchestrator);
+
       // Persist to autoresearch.jsonl (always, regardless of status)
       try {
-        const jsonlPath = path.join(workDir, "autoresearch.jsonl");
-        fs.appendFileSync(jsonlPath, JSON.stringify({
+        fs.appendFileSync(paths.jsonlPath, JSON.stringify({
           run: state.results.length,
           ...experiment,
         }) + "\n");
@@ -1547,9 +1971,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       // Auto-revert on discard/crash/checks_failed — revert all files except autoresearch session files
       if (params.status !== "keep") {
         try {
-          const protectedFiles = ["autoresearch.jsonl", "autoresearch.md", "autoresearch.ideas.md", "autoresearch.sh", "autoresearch.checks.sh"];
-          const stageCmd = protectedFiles.map((f) => `git add "${path.join(workDir, f)}" 2>/dev/null || true`).join("; ");
-          await pi.exec("bash", ["-c", `${stageCmd}; git checkout -- .; git clean -fd 2>/dev/null`], { cwd: workDir, timeout: 10000 });
+          const protectedFiles = buildProtectedRelativePaths(paths, execWorkDir);
+          await pi.exec(
+            "bash",
+            ["-c", buildRevertCommand(protectedFiles)],
+            { cwd: execWorkDir, timeout: 10000 }
+          );
           text += `\n📝 Git: reverted changes (${params.status}) — autoresearch files preserved`;
         } catch (e) {
           text += `\n⚠️ Git revert failed: ${e instanceof Error ? e.message : String(e)}`;
@@ -1577,6 +2004,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         details: {
           experiment: { ...experiment, metrics: { ...experiment.metrics } },
           state: cloneExperimentState(state),
+          orchestrator: runtime.orchestrator ?? undefined,
         } as LogDetails,
       };
     },
@@ -1590,6 +2018,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             ? "error"
             : "warning";
       text += theme.fg(color, args.status);
+      if (args.lane_id) {
+        text += theme.fg("dim", ` [${args.lane_id}]`);
+      }
       text += " " + theme.fg("dim", args.description);
       return new Text(text, 0, 0);
     },
@@ -1618,6 +2049,12 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
 
       text += " " + theme.fg("muted", exp.description);
+      if (exp.laneId) {
+        text += theme.fg("dim", ` [${exp.laneId}]`);
+      }
+      if (exp.candidateId) {
+        text += theme.fg("dim", ` ${exp.candidateId}`);
+      }
 
       if (s.bestMetric !== null) {
         text +=
@@ -1649,7 +2086,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       const runtime = getRuntime(ctx);
       const state = runtime.state;
       if (state.results.length === 0) {
-        if (!runtime.autoresearchMode && !fs.existsSync(path.join(resolveWorkDir(ctx.cwd), "autoresearch.md"))) {
+        if (!runtime.autoresearchMode && !fs.existsSync(getSessionPaths(ctx.cwd).mdPath)) {
           ctx.ui.notify("No experiments yet — run /autoresearch to get started", "info");
         } else {
           ctx.ui.notify("No experiments yet", "info");
@@ -1698,17 +2135,20 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
             render(width: number): string[] {
               const termH = process.stdout.rows || 40;
               // Content gets the full width — no box borders
-              const content = renderDashboardLines(state, width, theme, 0);
+              const content = renderDashboardLines(state, runtime.orchestrator, width, theme, 0);
 
               // Add running experiment as next row in the list
               if (runtime.runningExperiment) {
                 const elapsed = formatElapsed(Date.now() - runtime.runningExperiment.startedAt);
                 const frame = SPINNER[spinnerFrame % SPINNER.length];
+                const laneText = runtime.runningExperiment.laneId
+                  ? ` [${runtime.runningExperiment.laneId}]`
+                  : "";
                 const nextIdx = state.results.length + 1;
                 content.push(
                   truncateToWidth(
                     `  ${theme.fg("dim", String(nextIdx).padEnd(3))}` +
-                    theme.fg("warning", `${frame} running… ${elapsed}`),
+                    theme.fg("warning", `${frame} running… ${elapsed}${laneText}`),
                     width
                   )
                 );
@@ -1842,7 +2282,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       if (command === "clear") {
-        const jsonlPath = path.join(resolveWorkDir(ctx.cwd), "autoresearch.jsonl");
+        const paths = getSessionPaths(ctx.cwd);
         runtime.autoresearchMode = false;
         runtime.dashboardExpanded = false;
         runtime.lastAutoResumeTime = 0;
@@ -1851,20 +2291,19 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         runtime.lastRunChecks = null;
         runtime.runningExperiment = null;
         runtime.state = createExperimentState();
+        runtime.orchestrator = null;
+        runtime.settings = null;
         updateWidget(ctx);
 
-        if (fs.existsSync(jsonlPath)) {
-          try {
-            fs.unlinkSync(jsonlPath);
-            ctx.ui.notify("Deleted autoresearch.jsonl and turned autoresearch mode OFF", "info");
-          } catch (error) {
-            ctx.ui.notify(
-              `Failed to delete autoresearch.jsonl: ${error instanceof Error ? error.message : String(error)}`,
-              "error"
-            );
-          }
-        } else {
-          ctx.ui.notify("No autoresearch.jsonl found. Autoresearch mode OFF", "info");
+        try {
+          if (fs.existsSync(paths.jsonlPath)) fs.unlinkSync(paths.jsonlPath);
+          if (fs.existsSync(paths.orchestratorPath)) fs.unlinkSync(paths.orchestratorPath);
+          ctx.ui.notify("Cleared autoresearch state files and turned autoresearch mode OFF", "info");
+        } catch (error) {
+          ctx.ui.notify(
+            `Failed to clear autoresearch state: ${error instanceof Error ? error.message : String(error)}`,
+            "error"
+          );
         }
         return;
       }
@@ -1872,8 +2311,8 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       runtime.autoresearchMode = true;
       runtime.autoResumeTurns = 0;
 
-      const mdPath = path.join(resolveWorkDir(ctx.cwd), "autoresearch.md");
-      const hasRules = fs.existsSync(mdPath);
+      const { paths } = loadSessionState(ctx);
+      const hasRules = fs.existsSync(paths.mdPath);
 
       if (hasRules) {
         ctx.ui.notify("Autoresearch mode ON — rules loaded from autoresearch.md", "info");

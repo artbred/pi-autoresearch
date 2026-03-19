@@ -10,8 +10,8 @@ Autonomous Kaggle competition loop: research the competition, build stronger not
 ## Tools
 
 - **`init_experiment`** — initialize the session with `metric_name="public_rank"` and `direction="lower"`.
-- **`run_experiment`** — run `./autoresearch.sh --local-only` for preflight work, obviously weak candidates, and quota-exhausted phases. When a valid candidate exists and submission quota is available, prefer `./autoresearch.sh --submit` so the loop keeps getting real leaderboard feedback.
-- **`log_experiment`** — record every run. Always include `public_score`, `cv_score`, and `submission_count` in the `metrics` dict.
+- **`run_experiment`** — run lane-attributed experiments. In parallel mode, use `lane_id` (`exploit`, `explore`, `merge`) and a stable `strategy_id` on every call. Use `./autoresearch.sh --local-only` for preflight work, obviously weak candidates, merge builds, and quota-exhausted phases. When a valid candidate exists and submission quota is available, prefer `./autoresearch.sh --submit` or `./autoresearch.sh --submit-candidate <candidate-id>` so the loop keeps getting real leaderboard feedback.
+- **`log_experiment`** — record every run. Always include `public_score`, `cv_score`, and `submission_count` in the `metrics` dict. Keep-worthy variants should carry `candidate_id`; set `action_type`, `score_state`, and `provisional` accurately so the extension can enforce freshness policies.
 
 Use the host `kaggle` CLI directly for auth, pushes, kernel status, output download, leaderboard refresh, and competition submission.
 
@@ -138,6 +138,7 @@ It must contain:
 - Allowed external datasets and how they may be used.
 - Leaderboard history: public rank, public score, CV score, and notes per submission.
 - Notebook variant log: what was tried, what failed, and why.
+- Parallel lane policy: what `exploit`, `explore`, and `merge` are currently testing, plus which candidate is first in line for the next scored submission.
 - Keep/discard policy:
   - Keep when `public_rank` improves.
   - If `public_rank` is unchanged, keep only when `public_score` improves.
@@ -152,6 +153,7 @@ This is the Kaggle loop entrypoint. It must support:
   - Run the local validation / training path
   - Verify the submission artifact exists
   - Verify the measured notebook wall-clock stays inside the configured runtime budget
+  - Materialize or refresh a candidate manifest under `outputs/candidates/<candidate-id>/manifest.json`
   - Emit machine-readable metrics for:
     - `public_rank`
     - `public_score`
@@ -174,6 +176,10 @@ This is the Kaggle loop entrypoint. It must support:
     - replace the submit path so the notebook version itself becomes the scored submission
     - do not force `kaggle competitions submit`
   - Refresh the correct score surface for the chosen mode and emit the same metric set
+- `./autoresearch.sh --submit-candidate <candidate-id>`
+  - Submit an already-built queued candidate deterministically instead of resubmitting whichever local artifact happened to be newest.
+- `./autoresearch.sh --merge-candidates <candidate-id[,candidate-id...]>`
+  - Build an artifact-level merge candidate, prefer ensembling compatible submissions, and record the merge inputs in the candidate manifest.
 
 Fail fast on:
 
@@ -209,6 +215,14 @@ Use when the user requires correctness or rules backpressure. The checks must va
 **Never stop unless interrupted.**
 
 - Treat public leaderboard position as the primary objective.
+- Never stall:
+  - every loop segment must produce a new candidate, a fresh public score, or an explicitly provisional keep during a submission blackout
+  - do not spend long stretches in local-only drift without queueing or scoring anything new
+- In parallel mode:
+  - use `exploit` for the best scored line
+  - use `explore` for a materially different hypothesis
+  - use `merge` only when at least two ready candidates exist and artifact-level combination is worth testing
+  - always pass `lane_id` and `strategy_id` to `run_experiment` and `log_experiment`
 - Every `log_experiment` call must include:
   - `public_score`
   - `cv_score`
@@ -225,12 +239,14 @@ Use when the user requires correctness or rules backpressure. The checks must va
   - When quota remains, periodically submit the strongest legal, runtime-safe candidate instead of endlessly accumulating local-only improvements.
   - If multiple promising local iterations have passed without a fresh public score, force a scored submission of the best current candidate and continue iterating from that scored result.
   - Keep the pending submission queue short while quota is available; it exists for quota exhaustion or brief staging, not for indefinite local-only drift.
+  - If the extension says a fresh score is required, the next admissible action is a scored submission or score refresh, not another local-only run.
 - When the daily submission limit is exhausted:
   - Do not stop.
   - Continue with `--local-only` experiments, discussion mining, feature work, and ensembling.
   - Prefer GPU-backed local runs when CUDA, ROCm, or MPS is available on the machine.
   - Queue strong candidates for the next submission window.
   - It is acceptable to keep a candidate provisionally when `cv_score` or robustness improves materially during a submission blackout; record clearly in `autoresearch.md` that the leaderboard validation is still pending.
+  - Queue promotion must be deterministic: when submissions reopen, submit the highest-priority queued candidate first.
 - Do not spend a submission on a notebook that is likely to exceed the notebook runtime limit.
   - If runtime is too close to the cap, simplify the pipeline, precompute assets, reduce folds or model count, or move heavy work into allowed datasets so the final scored run still fits inside the budget.
 - When the competition is internet-off or notebook-only:
