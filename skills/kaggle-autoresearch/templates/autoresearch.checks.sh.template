@@ -7,12 +7,16 @@ cd "$ROOT_DIR"
 NOTEBOOK_SRC="${NOTEBOOK_SRC:-notebook.py}"
 NOTEBOOK_IPYNB="${NOTEBOOK_IPYNB:-notebook.ipynb}"
 SUBMISSION_FILE="${SUBMISSION_FILE:-outputs/__SUBMISSION_FILENAME__}"
+METRICS_FILE="${METRICS_FILE:-outputs/metrics.json}"
 KERNEL_METADATA_FILE="${KERNEL_METADATA_FILE:-kernel-metadata.json}"
 REQUIRED_COLUMNS="${REQUIRED_COLUMNS:-__ID_COLUMN__,__TARGET_COLUMN__}"
 ALLOW_GPU="${ALLOW_GPU:-false}"
 ALLOW_INTERNET="${ALLOW_INTERNET:-false}"
 ALLOWED_DATASET_SOURCES="${ALLOWED_DATASET_SOURCES:-}"
 FORBIDDEN_PATTERNS="${FORBIDDEN_PATTERNS:-}"
+NOTEBOOK_RUNTIME_LIMIT_SECONDS="${NOTEBOOK_RUNTIME_LIMIT_SECONDS:-__NOTEBOOK_RUNTIME_LIMIT_SECONDS__}"
+NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS="${NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS:-__NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS__}"
+NOTEBOOK_RUNTIME_BUDGET_SECONDS="${NOTEBOOK_RUNTIME_BUDGET_SECONDS:-__NOTEBOOK_RUNTIME_BUDGET_SECONDS__}"
 
 python3 build_notebook.py --input "$NOTEBOOK_SRC" --output "$NOTEBOOK_IPYNB" >/dev/null
 
@@ -39,6 +43,35 @@ with submission_path.open(newline="") as handle:
     first_row = next(reader, None)
     if first_row is None:
         raise SystemExit("Submission file has no prediction rows.")
+PY
+
+python3 - "$METRICS_FILE" "$NOTEBOOK_RUNTIME_BUDGET_SECONDS" "$NOTEBOOK_RUNTIME_LIMIT_SECONDS" "$NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+metrics_path = Path(sys.argv[1])
+budget = float(sys.argv[2])
+limit = float(sys.argv[3])
+margin = float(sys.argv[4])
+
+if not metrics_path.exists():
+    raise SystemExit(f"Missing metrics file: {metrics_path}")
+
+payload = json.loads(metrics_path.read_text())
+wall_clock = payload.get("wall_clock_seconds")
+if wall_clock is None:
+    raise SystemExit("metrics.json is missing wall_clock_seconds.")
+
+wall_clock = float(wall_clock)
+if wall_clock > budget:
+    raise SystemExit(
+        "Notebook runtime budget exceeded: "
+        f"wall_clock_seconds={wall_clock:.3f}, "
+        f"budget_seconds={budget:.3f}, "
+        f"limit_seconds={limit:.3f}, "
+        f"safety_margin_seconds={margin:.3f}"
+    )
 PY
 
 python3 - "$KERNEL_METADATA_FILE" "$ALLOW_GPU" "$ALLOW_INTERNET" "$ALLOWED_DATASET_SOURCES" <<'PY'

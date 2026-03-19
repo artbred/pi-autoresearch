@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import time
 from pathlib import Path
 from statistics import fmean
 
@@ -23,6 +24,24 @@ TARGET_COLUMN = "__TARGET_COLUMN__"
 CV_METRIC_NAME = "__CV_METRIC_NAME__"
 SUBMISSION_FILENAME = "__SUBMISSION_FILENAME__"
 LOCAL_ACCELERATOR = os.environ.get("LOCAL_ACCELERATOR", "cpu")
+NOTEBOOK_RUNTIME_LIMIT_SECONDS = float(
+    os.environ.get("NOTEBOOK_RUNTIME_LIMIT_SECONDS", "__NOTEBOOK_RUNTIME_LIMIT_SECONDS__")
+)
+NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS = float(
+    os.environ.get(
+        "NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS",
+        "__NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS__",
+    )
+)
+NOTEBOOK_RUNTIME_BUDGET_SECONDS = max(
+    0.0,
+    float(
+        os.environ.get(
+            "NOTEBOOK_RUNTIME_BUDGET_SECONDS",
+            "__NOTEBOOK_RUNTIME_BUDGET_SECONDS__",
+        )
+    ),
+)
 
 ROOT = Path(".")
 DATA_DIR = ROOT / "data"
@@ -30,6 +49,7 @@ OUTPUT_DIR = ROOT / "outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 SUBMISSION_PATH = OUTPUT_DIR / SUBMISSION_FILENAME
 METRICS_PATH = OUTPUT_DIR / "metrics.json"
+RUN_STARTED_AT = time.monotonic()
 
 
 def load_rows(path: Path) -> list[dict[str, str]]:
@@ -65,6 +85,23 @@ def estimate_cv_score(train_rows: list[dict[str, str]]) -> float:
     return round(fmean(targets), 6)
 
 
+def elapsed_runtime_seconds() -> float:
+    return round(time.monotonic() - RUN_STARTED_AT, 3)
+
+
+def remaining_runtime_seconds() -> float:
+    return round(NOTEBOOK_RUNTIME_BUDGET_SECONDS - elapsed_runtime_seconds(), 3)
+
+
+def ensure_runtime_budget(stage: str) -> None:
+    remaining = remaining_runtime_seconds()
+    if remaining <= 0:
+        raise RuntimeError(
+            f"Notebook runtime budget exhausted before {stage}. "
+            f"budget={NOTEBOOK_RUNTIME_BUDGET_SECONDS:.3f}s"
+        )
+
+
 def build_predictions(test_rows: list[dict[str, str]], cv_score: float) -> list[dict[str, str]]:
     prediction = f"{cv_score:.6f}"
     return [
@@ -84,20 +121,34 @@ def write_submission(predictions: list[dict[str, str]]) -> None:
 
 
 def write_metrics(cv_score: float) -> None:
+    wall_clock_seconds = elapsed_runtime_seconds()
     payload = {
         "cv_score": cv_score,
         "submission_path": str(SUBMISSION_PATH),
         "competition_slug": COMPETITION_SLUG,
         "local_accelerator": LOCAL_ACCELERATOR,
+        "wall_clock_seconds": wall_clock_seconds,
+        "runtime_limit_seconds": NOTEBOOK_RUNTIME_LIMIT_SECONDS,
+        "runtime_safety_margin_seconds": NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS,
+        "runtime_budget_seconds": NOTEBOOK_RUNTIME_BUDGET_SECONDS,
+        "remaining_runtime_seconds": round(
+            NOTEBOOK_RUNTIME_BUDGET_SECONDS - wall_clock_seconds,
+            3,
+        ),
+        "within_runtime_budget": wall_clock_seconds <= NOTEBOOK_RUNTIME_BUDGET_SECONDS,
     }
     METRICS_PATH.write_text(json.dumps(payload, indent=2) + "\n")
 
 
 def main() -> int:
+    ensure_runtime_budget("data loading")
     train_rows = load_training_rows()
     test_rows = load_test_rows()
+    ensure_runtime_budget("model training")
     cv_score = estimate_cv_score(train_rows)
+    ensure_runtime_budget("prediction generation")
     predictions = build_predictions(test_rows, cv_score)
+    ensure_runtime_budget("submission write")
     write_submission(predictions)
     write_metrics(cv_score)
 
@@ -105,6 +156,8 @@ def main() -> int:
     print(f"{CV_METRIC_NAME}={cv_score}")
     print(f"submission_path={SUBMISSION_PATH}")
     print(f"local_accelerator={LOCAL_ACCELERATOR}")
+    print(f"wall_clock_seconds={elapsed_runtime_seconds()}")
+    print(f"runtime_budget_seconds={NOTEBOOK_RUNTIME_BUDGET_SECONDS}")
     return 0
 
 

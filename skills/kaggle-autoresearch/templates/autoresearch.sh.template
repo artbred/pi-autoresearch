@@ -27,6 +27,9 @@ MAX_DAILY_SUBMISSIONS="${MAX_DAILY_SUBMISSIONS:-__SUBMISSION_CAP__}"
 KERNEL_STATUS_POLL_SECONDS="${KERNEL_STATUS_POLL_SECONDS:-20}"
 KERNEL_STATUS_MAX_POLLS="${KERNEL_STATUS_MAX_POLLS:-45}"
 POST_SUBMIT_SLEEP_SECONDS="${POST_SUBMIT_SLEEP_SECONDS:-10}"
+NOTEBOOK_RUNTIME_LIMIT_SECONDS="${NOTEBOOK_RUNTIME_LIMIT_SECONDS:-__NOTEBOOK_RUNTIME_LIMIT_SECONDS__}"
+NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS="${NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS:-__NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS__}"
+NOTEBOOK_RUNTIME_BUDGET_SECONDS="${NOTEBOOK_RUNTIME_BUDGET_SECONDS:-__NOTEBOOK_RUNTIME_BUDGET_SECONDS__}"
 
 mkdir -p "$(dirname "$METRICS_FILE")" "$KERNEL_OUTPUT_DIR"
 CURRENT_SUBMISSION_COUNT=""
@@ -217,6 +220,40 @@ print(payload.get(key, default_value))
 PY
 }
 
+validate_runtime_budget() {
+  python3 - "$METRICS_FILE" "$NOTEBOOK_RUNTIME_BUDGET_SECONDS" "$NOTEBOOK_RUNTIME_LIMIT_SECONDS" "$NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+metrics_path = Path(sys.argv[1])
+budget = float(sys.argv[2])
+limit = float(sys.argv[3])
+margin = float(sys.argv[4])
+
+if not metrics_path.exists():
+    raise SystemExit(f"Missing metrics file: {metrics_path}")
+
+payload = json.loads(metrics_path.read_text())
+wall_clock = payload.get("wall_clock_seconds")
+if wall_clock is None:
+    raise SystemExit(
+        "Missing wall_clock_seconds in metrics.json. "
+        "The notebook must report runtime so preflight can enforce the Kaggle time budget."
+    )
+
+wall_clock = float(wall_clock)
+if wall_clock > budget:
+    raise SystemExit(
+        "Notebook runtime budget exceeded: "
+        f"wall_clock_seconds={wall_clock:.3f}, "
+        f"budget_seconds={budget:.3f}, "
+        f"limit_seconds={limit:.3f}, "
+        f"safety_margin_seconds={margin:.3f}"
+    )
+PY
+}
+
 require_kaggle_auth() {
   local config_dir="${KAGGLE_CONFIG_DIR:-$HOME/.kaggle}"
   local legacy_json_path="${config_dir}/kaggle.json"
@@ -254,6 +291,7 @@ run_local_pipeline() {
   [[ $status -eq 0 ]] || die "Local run failed with exit code ${status}."
   [[ -f "$METRICS_FILE" ]] || die "Local run did not create metrics file: $METRICS_FILE"
   [[ -f "$SUBMISSION_FILE" ]] || die "Local run did not create submission artifact: $SUBMISSION_FILE"
+  validate_runtime_budget
 }
 
 fetch_submissions_csv() {

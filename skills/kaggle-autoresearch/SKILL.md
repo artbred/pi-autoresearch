@@ -23,10 +23,17 @@ Ask or infer these before writing files:
 4. **Submission artifact** — expected file path, required columns, and how the local run produces it.
 5. **Competition mode** — file-upload, notebook-only/code-submission, hybrid notebook-plus-file, or offline asset-backed workflow.
 6. **Files in scope** — what may be edited.
-7. **Resource flags** — GPU, internet, time limits, memory limits, daily submission cap.
+7. **Resource flags** — GPU, internet, hard notebook wall-clock limit, required safety margin, memory limits, daily submission cap.
 8. **Hard constraints** — off-limits data, banned techniques, licensing limits, and competition-specific rules.
 
 If the user does not specify them, infer conservative defaults and write those assumptions into `autoresearch.md`.
+
+Treat notebook runtime as a hard constraint, not a soft preference:
+
+- Infer or confirm the maximum allowed notebook execution time for the competition environment.
+- Convert that into an explicit working budget with safety margin, for example `hard_limit - reserve`.
+- Make the generated notebook aware of that budget and fail early or degrade gracefully before it risks timing out.
+- Keep the agent aware of the same budget in `autoresearch.md`, `autoresearch.sh`, and `autoresearch.checks.sh` so candidates that cannot finish on time are rejected before spending a submission slot.
 
 ## Setup Workflow
 
@@ -44,13 +51,14 @@ If the user does not specify them, infer conservative defaults and write those a
    - `notebook.py.template` -> `notebook.py`
    - `build_notebook.py.template` -> `build_notebook.py`
    - `kernel-metadata.json.template` -> `kernel-metadata.json`
-5. Replace template placeholders with the actual competition metadata, notebook paths, submission file path, validation metric, allowlists, guardrails, and competition mode.
+5. Replace template placeholders with the actual competition metadata, notebook paths, submission file path, validation metric, runtime budget, allowlists, guardrails, and competition mode.
 6. Commit the generated session files once they are correct.
 7. Call:
    - `init_experiment` with `name="<competition-slug> first-place chase"`, `metric_name="public_rank"`, `metric_unit=""`, and `direction="lower"`.
 8. Run a baseline:
    - Start with `./autoresearch.sh --local-only` to confirm the notebook builds and the local pipeline writes the submission artifact and `cv_score`.
    - Once the submission path is valid, run the competition-mode-specific submission flow to establish the first public rank baseline.
+   - Confirm the measured local wall-clock runtime stays inside the notebook execution budget with the configured safety margin before treating the candidate as submission-ready.
 9. Detect local acceleration early:
    - Check for CUDA, ROCm, or MPS on the current machine.
    - If a GPU is available, bias local training, ensembling, and notebook execution toward using it during long local iteration phases.
@@ -116,6 +124,7 @@ It must contain:
 - Competition summary: title, slug, URL, deadline, evaluation metric, leaderboard context, and competition mode.
 - Rules and leakage bans: forbidden external data, sharing limits, and any special competition constraints.
 - Submission budget: daily cap, reserve policy, and when to spend a submission.
+- Notebook runtime budget: hard limit, safety margin, target wall-clock budget, and what to simplify or precompute if a candidate risks timing out.
 - Dependency packaging plan: wheels datasets, model attachments, mounted assets, and install order.
 - Local validation strategy: folds, time split or leakage controls, and tie-breaker logic.
 - Score acquisition path: exactly how a new score appears for this competition.
@@ -136,6 +145,7 @@ This is the Kaggle loop entrypoint. It must support:
   - Build `notebook.ipynb` from `notebook.py`
   - Run the local validation / training path
   - Verify the submission artifact exists
+  - Verify the measured notebook wall-clock stays inside the configured runtime budget
   - Emit machine-readable metrics for:
     - `public_rank`
     - `public_score`
@@ -164,6 +174,7 @@ Fail fast on:
 - Missing Kaggle credentials or missing `kaggle` CLI
 - Rules not accepted for the competition
 - Missing submission artifact
+- Runtime-budget violations or missing runtime-budget metrics
 - Kernel run failure
 - Missing kernel output files
 
@@ -182,6 +193,7 @@ Use when the user requires correctness or rules backpressure. The checks must va
 - The notebook rebuilds successfully.
 - The submission file schema matches the competition contract.
 - `kernel-metadata.json` resource flags stay inside the allowed limits.
+- The most recent notebook run reports wall-clock runtime and stays inside the configured execution budget.
 - Disallowed datasets, file paths, or banned patterns are not present.
 
 ## Loop Rules
@@ -206,9 +218,11 @@ Use when the user requires correctness or rules backpressure. The checks must va
   - Prefer GPU-backed local runs when CUDA, ROCm, or MPS is available on the machine.
   - Queue strong candidates for the next submission window.
   - It is acceptable to keep a candidate provisionally when `cv_score` or robustness improves materially during a submission blackout; record clearly in `autoresearch.md` that the leaderboard validation is still pending.
+- Do not spend a submission on a notebook that is likely to exceed the notebook runtime limit.
+  - If runtime is too close to the cap, simplify the pipeline, precompute assets, reduce folds or model count, or move heavy work into allowed datasets so the final scored run still fits inside the budget.
 - When the competition is internet-off or notebook-only:
   - treat packaging, dependency installation, and submission mechanics as first-class optimization work
-  - keep a written checklist for wheel datasets, mounted paths, notebook version IDs, and score retrieval steps
+  - keep a written checklist for wheel datasets, mounted paths, notebook version IDs, runtime budget, and score retrieval steps
 - Mine discussions, public notebooks, and public datasets aggressively, but stay inside the written rules.
 - Never use leaked labels, private sharing rings, forbidden external data, or any technique that risks disqualification.
 - Write promising but deferred ideas to `autoresearch.ideas.md`.

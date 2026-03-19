@@ -146,6 +146,7 @@ The Kaggle skill asks or infers:
 - submission artifact path
 - local validation metric
 - resource limits
+- notebook runtime budget and safety margin
 - competition mode
 - rules and hard constraints
 
@@ -196,6 +197,7 @@ The skill is supposed to understand:
 - whether a file upload is still required after the notebook finishes
 - whether internet is disabled
 - whether custom wheels must be packaged as datasets
+- what notebook wall-clock limit the scored run must fit inside
 - how the next score actually appears for this competition
 
 That is why the Kaggle skill is more detailed than the generic skill.
@@ -243,6 +245,12 @@ Instead it:
 - carries forward the last known public metrics
 - uses local CV to triage ideas
 - resumes leaderboard validation when submissions reopen
+
+The generated notebook and scripts also treat notebook runtime as a hard gate:
+
+- the notebook records wall-clock runtime
+- local preflight rejects candidates that exceed the runtime budget
+- the agent is expected to keep a safety margin instead of aiming at the hard cap
 
 ### Local GPU Use
 

@@ -13,6 +13,7 @@ Win the Kaggle competition `__COMPETITION_SLUG__` by iterating on notebook submi
 - Score acquisition path: __SCORE_ACQUISITION_PATH__
 - Internet policy: __INTERNET_POLICY__
 - Resource flags: __RESOURCE_FLAGS__
+- Notebook runtime limit: __NOTEBOOK_RUNTIME_LIMIT__
 
 ## Metrics
 - Primary: `public_rank` (position, lower is better)
@@ -50,6 +51,14 @@ Win the Kaggle competition `__COMPETITION_SLUG__` by iterating on notebook submi
 - __CONSTRAINTS__
 - Stay inside the written Kaggle rules at all times.
 - Do not spend submissions carelessly; preserve quota for high-confidence candidates.
+- Keep every scored notebook run inside the runtime budget with margin; if a candidate is too close to the cap, simplify it before submission.
+
+## Notebook Runtime Budget
+- Hard limit: __NOTEBOOK_RUNTIME_LIMIT__
+- Safety margin: __NOTEBOOK_RUNTIME_SAFETY_MARGIN__
+- Target runtime budget: __NOTEBOOK_RUNTIME_BUDGET__
+- Runtime strategy: __NOTEBOOK_RUNTIME_STRATEGY__
+- Last measured local notebook runtime: __LAST_MEASURED_NOTEBOOK_RUNTIME__
 
 ## Rules / Leakage Bans
 - Allowed external datasets: __ALLOWED_DATASETS__
@@ -82,6 +91,7 @@ Win the Kaggle competition `__COMPETITION_SLUG__` by iterating on notebook submi
 - Folds / split strategy: __VALIDATION_STRATEGY__
 - Leakage controls: __LEAKAGE_CONTROLS__
 - Tie-breakers: prefer robustness over noisy CV spikes.
+- Runtime gate: reject notebook variants that are likely to exceed the notebook budget on Kaggle.
 
 ## Discussion Mining
 - High-signal discussions:
