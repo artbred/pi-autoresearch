@@ -1,15 +1,15 @@
 <div align="center">
 <img src="https://github.com/user-attachments/assets/4a5c06ab-c1bb-4d9c-9173-1fd330763a59" width="250">
-  
+
 # pi-autoresearch
 ### Autonomous experiment loop for pi
-**[Install](#install)** · **[Usage](#usage)** · **[How it works](#how-it-works)**
+**[Install](#install)** · **[Usage](#usage)** · **[Kaggle Mode](#kaggle-mode)** · **[How It Works](#how-it-works)**
 
 </div>
 
-*Try an idea, measure it, keep what works, discard what doesn't, repeat forever.*
+*Try an idea, measure it, keep what works, discard what doesn't, repeat.*
 
-Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch). Works for generic optimization targets and now ships with a Kaggle competition mode focused on chasing leaderboard gains with notebook submissions.
+Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch). This package provides a reusable autoresearch loop for pi: one generic extension plus domain-specific skills. It works for classic optimization problems like test speed or build time, and it now also ships with a Kaggle-first competition skill.
 
 ---
 
@@ -17,179 +17,268 @@ Inspired by [karpathy/autoresearch](https://github.com/karpathy/autoresearch). W
 
 ---
 
-## Quick start
+## What This Is
 
-```bash
-pi install https://github.com/davebcn87/pi-autoresearch
-```
+`pi-autoresearch` is a way to make the agent work like a persistent experiment runner instead of a one-shot assistant.
 
-## What's included
+The core loop is simple:
 
-| | |
+1. Change something.
+2. Run the workload.
+3. Measure the result.
+4. Keep the change if it improved the target.
+5. Revert it if it did not.
+6. Repeat until interrupted.
+
+The extension provides the generic mechanics for this loop. The skill provides the domain knowledge for what to optimize and how to run it.
+
+That split matters:
+
+- The extension should stay reusable.
+- The skill should encode domain-specific judgment.
+- Session files should let a fresh agent resume without prior memory.
+
+## Core Idea
+
+This repo is built around three persistent artifacts:
+
+- `autoresearch.jsonl`
+  - append-only run history
+  - metrics, status, commit, and description for every iteration
+- `autoresearch.md`
+  - living session memory
+  - objective, constraints, what has been tried, dead ends, and next ideas
+- `autoresearch.sh`
+  - executable workload entrypoint
+  - the thing that actually runs and emits metrics
+
+That gives you an optimization loop that survives restarts, context resets, and long autonomous sessions.
+
+## What's Included
+
+| Part | Purpose |
 |---|---|
-| **Extension** | Tools + live widget + `/autoresearch` dashboard |
-| **Skills** | Generic setup skill plus a Kaggle-first competition skill |
+| Extension | Tools, widget, dashboard, `/autoresearch` command |
+| `autoresearch-create` | Generic optimization skill |
+| `kaggle-autoresearch` | Kaggle competition skill |
 
-### Extension tools
+### Extension Tools
 
 | Tool | Description |
-|------|-------------|
-| `init_experiment` | One-time session config — name, metric, unit, direction |
-| `run_experiment` | Runs any command, times wall-clock duration, captures output |
-| `log_experiment` | Records result, auto-commits, updates widget and dashboard |
+|---|---|
+| `init_experiment` | Initialize session metadata: name, primary metric, unit, direction |
+| `run_experiment` | Run the workload, time it, capture output, detect failure |
+| `log_experiment` | Record result, update dashboard, commit or revert automatically |
 
-### `/autoresearch` command
+### `/autoresearch` Command
 
-| Subcommand | Description |
-|------------|-------------|
-| `/autoresearch <text>` | Enter autoresearch mode. If `autoresearch.md` exists, resumes the loop with `<text>` as context. Otherwise, sets up a new session. |
-| `/autoresearch off` | Leave autoresearch mode. Stops auto-resume and clears runtime state but keeps `autoresearch.jsonl` intact. |
-| `/autoresearch clear` | Delete `autoresearch.jsonl`, reset all state, and turn autoresearch mode off. Use this for a clean start. |
+| Command | Description |
+|---|---|
+| `/autoresearch <text>` | Start or resume autoresearch mode |
+| `/autoresearch off` | Leave autoresearch mode |
+| `/autoresearch clear` | Reset runtime state and delete `autoresearch.jsonl` |
 
-**Examples:**
+Examples:
 
-```
+```text
 /autoresearch optimize unit test runtime, monitor correctness
 /autoresearch model training, run 5 minutes of train.py and note the loss ratio as optimization target
 /autoresearch chase first place in titanic, mine discussions, and iterate on notebook submissions
-/autoresearch off
-/autoresearch clear
 ```
-
-### Keyboard shortcuts
-
-| Shortcut | Description |
-|----------|-------------|
-| `Ctrl+X` | Toggle dashboard expand/collapse (inline widget ↔ full results table above the editor) |
-| `Ctrl+Shift+X` | Open fullscreen scrollable dashboard overlay. Navigate with `↑`/`↓`/`j`/`k`, `PageUp`/`PageDown`/`u`/`d`, `g`/`G` for top/bottom, `Escape` or `q` to close. |
 
 ### UI
 
-- **Status widget** — always visible above the editor: `🔬 autoresearch 12 runs 8 kept │ best: 42.3s`
-- **Expanded dashboard** — `Ctrl+X` expands the widget into a full results table with columns for commit, metric, status, and description.
-- **Fullscreen overlay** — `Ctrl+Shift+X` opens a scrollable full-terminal dashboard. Shows a live spinner with elapsed time for running experiments.
-### Skill
+- Status widget above the editor
+- Expanded dashboard with recent runs
+- Fullscreen dashboard overlay
 
-`autoresearch-create` handles generic optimization targets. `kaggle-autoresearch` is the Kaggle-first skill for competition workflows. It asks or infers the competition slug, notebook paths, validation metric, submission artifact, file scope, and constraints — then writes the session files and starts the loop.
+Keyboard shortcuts:
 
-| File | Purpose |
-|------|---------|
-| `autoresearch.md` | Session document — objective, metrics, files in scope, what's been tried. A fresh agent can resume from this alone. |
-| `autoresearch.sh` | Experiment script — pre-checks, runs the workload, outputs `METRIC name=number` lines. |
-| `autoresearch.checks.sh` | *(optional)* Backpressure checks — tests, types, lint. Runs after each passing experiment command. Failures block `keep`. |
-| `notebook.py` | *(Kaggle skill)* Editable source-of-truth notebook script. |
-| `notebook.ipynb` | *(Kaggle skill)* Generated Kaggle upload artifact. |
-| `build_notebook.py` | *(Kaggle skill)* Renders `notebook.py` to `notebook.ipynb`. |
-| `kernel-metadata.json` | *(Kaggle skill)* Kaggle kernel packaging + resource flags. |
-
----
+- `Ctrl+X` toggles compact vs expanded dashboard
+- `Ctrl+Shift+X` opens the fullscreen dashboard
 
 ## Install
 
 ```bash
-pi install https://github.com/davebcn87/pi-autoresearch
+pi install https://github.com/artbred/pi-autoresearch
 ```
 
-<details>
-<summary>Manual install</summary>
+Manual install:
 
 ```bash
 cp -r extensions/pi-autoresearch ~/.pi/agent/extensions/
 cp -r skills/* ~/.pi/agent/skills/
 ```
 
-Then `/reload` in pi.
-
-</details>
-
----
+Then run `/reload` in pi.
 
 ## Usage
 
-### 1. Start autoresearch
+### Generic Autoresearch
 
-```
+Use the generic skill when you want to optimize a measurable workload:
+
+```text
 /skill:autoresearch-create
+```
+
+Typical examples:
+
+- test runtime
+- build time
+- bundle size
+- model loss
+- Lighthouse score
+
+### Kaggle Autoresearch
+
+Use the Kaggle skill when the problem is not just "optimize code" but "win or climb a Kaggle competition":
+
+```text
 /skill:kaggle-autoresearch
 ```
 
-Use `/skill:autoresearch-create` for generic optimization work. Use `/skill:kaggle-autoresearch` for Kaggle competitions. The Kaggle skill asks about the competition, notebook paths, validation metric, submission artifact, file scope, and constraints, then creates a branch, writes the session files, runs a local baseline, and moves into leaderboard-focused iteration.
+The Kaggle skill asks or infers:
 
-### 2. The loop
+- competition slug / URL
+- notebook source path
+- notebook artifact path
+- submission artifact path
+- local validation metric
+- resource limits
+- competition mode
+- rules and hard constraints
 
-The agent runs autonomously: edit → commit → `run_experiment` → `log_experiment` → keep or revert → repeat. It never stops unless interrupted.
+Then it creates the working session files and starts iterating.
 
-Every result is appended to `autoresearch.jsonl` in your project — one line per run. This means:
+## Kaggle Mode
 
-- **Survives restarts** — the agent can resume a session by reading the file
-- **Survives context resets** — `autoresearch.md` captures what's been tried so a fresh agent has full context
-- **Human readable** — open it anytime to see the full history
-- **Branch-aware** — each branch has its own session
+The Kaggle skill exists because Kaggle is not a single workflow. Different competitions produce new scores in different ways.
 
-### 3. Monitor progress
+The skill now tells the agent to classify the competition before deciding how to submit:
 
-- **Widget** — always visible above the editor
-- **`/autoresearch`** — full dashboard with results table and best run
-- **`Escape`** — interrupt anytime and ask for a summary
+### 1. File-upload competitions
 
----
+- The scored artifact is a file such as `submission.csv`.
+- The notebook or local run produces the file.
+- The file is uploaded to the competition page or submitted with `kaggle competitions submit`.
+- The score appears after Kaggle evaluates that file.
 
-## Example domains
+### 2. Notebook-only or code competitions
 
-| Domain | Metric | Command |
-|--------|--------|---------|
-| Test speed | seconds ↓ | `pnpm test` |
-| Bundle size | KB ↓ | `pnpm build && du -sb dist` |
-| LLM training | val_bpb ↓ | `uv run train.py` |
-| Build speed | seconds ↓ | `pnpm build` |
-| Lighthouse | perf score ↑ | `lighthouse http://localhost:3000 --output=json` |
-| Kaggle competition | public rank ↓ | `./autoresearch.sh --submit` |
+- The notebook version itself is the submission.
+- The agent must not blindly assume `kaggle competitions submit` is correct.
+- The score appears only after Kaggle runs and evaluates that notebook version.
 
-## Kaggle First-Place Mode
+### 3. Hybrid notebook-plus-file competitions
 
-`kaggle-autoresearch` keeps the extension generic while giving the agent a Kaggle-specific playbook:
+- The notebook must run first.
+- That notebook produces `submission.csv`.
+- Then the produced file must still be submitted to the competition to get a score.
 
-- Research the competition page, rules, discussions, public notebooks, and allowed external datasets.
-- Classify the competition first: file-upload, notebook-only/code-submission, hybrid notebook-plus-file, or offline asset-backed workflow.
-- Maintain `autoresearch.md` as the competition memory file: rules, leakage bans, leaderboard history, discussion ideas, and notebook variants.
-- Edit `notebook.py`, render it into `notebook.ipynb`, and submit through the Kaggle CLI.
-- Optimize for `public_rank` with `lower` as better while tracking `public_score`, `cv_score`, and `submission_count`.
+### 4. Internet-off notebook competitions
 
-The generated `autoresearch.sh` supports two modes:
+- The notebook cannot fetch dependencies from the internet.
+- Wheels or other custom dependencies must be uploaded as a Kaggle dataset or attached assets.
+- The notebook must install from mounted dataset paths with internet disabled.
 
-- `./autoresearch.sh --local-only` builds the notebook, runs the local validation path, checks that the submission artifact exists, and emits parseable metrics without spending a Kaggle submission.
-- `./autoresearch.sh --submit` runs the local path, pushes the notebook with the Kaggle CLI, downloads kernel outputs, submits to the competition, refreshes leaderboard state, and emits the same metric set.
-- If the daily Kaggle submission cap is already exhausted, `./autoresearch.sh --submit` does not stop the loop. It records the candidate in a pending queue, carries forward the last known public metrics, and keeps the loop in local iteration mode until submissions reopen.
+### 5. Asset-backed competitions
 
-The generated local path also detects the best local accelerator it can find and exports `LOCAL_ACCELERATOR` for the notebook or training command. Out of the box it checks for CUDA, ROCm, and MPS, so the agent can keep using GPU-backed local experiments while the submission window is closed.
+- The run depends on large weights, tokenizers, embeddings, custom packages, or model artifacts.
+- Those assets must be versioned and attached through Kaggle datasets or Kaggle models.
 
-Important edge case: not every competition uses the same score path. The Kaggle skill now expects the agent to distinguish between:
+### Why This Matters
 
-- file-upload competitions, where `submission.csv` goes straight to the competition page or `kaggle competitions submit`
-- notebook-only or code competitions, where the notebook version itself is the scored submission
-- hybrid competitions, where the notebook must run first and the resulting `submission.csv` must then be uploaded
-- internet-off notebook competitions, where wheels or other custom dependencies must be uploaded as datasets and installed from mounted paths because `enable_internet` is `false`
+The skill is supposed to understand:
 
-### Kaggle prerequisites
+- what the real submission artifact is
+- whether a notebook version itself is the scored submission
+- whether a file upload is still required after the notebook finishes
+- whether internet is disabled
+- whether custom wheels must be packaged as datasets
+- how the next score actually appears for this competition
 
-Install and authenticate the Kaggle CLI before running the submit path:
+That is why the Kaggle skill is more detailed than the generic skill.
+
+## Kaggle Workflow
+
+The generated Kaggle workbench usually includes:
+
+| File | Purpose |
+|---|---|
+| `autoresearch.md` | competition memory, rules, leaderboard history, ideas |
+| `autoresearch.sh` | local run + submit workflow |
+| `autoresearch.checks.sh` | schema, rules, packaging, and guardrail checks |
+| `notebook.py` | editable source-of-truth notebook script |
+| `notebook.ipynb` | generated Kaggle notebook artifact |
+| `build_notebook.py` | renders `notebook.py` to `.ipynb` |
+| `kernel-metadata.json` | Kaggle kernel packaging and resource flags |
+
+### Kaggle Metrics
+
+Primary metric:
+
+- `public_rank`
+
+Tracked secondary metrics:
+
+- `public_score`
+- `cv_score`
+- `submission_count`
+
+### Kaggle Keep / Discard Logic
+
+- Keep when `public_rank` improves.
+- If `public_rank` is unchanged, use improved `public_score` as the tie-breaker.
+- During submission blackout, the loop may keep a candidate provisionally based on stronger local validation or robustness, but it must mark that leaderboard validation is still pending.
+
+### Submission Limits
+
+The Kaggle loop does not stop when the daily submission cap is exhausted.
+
+Instead it:
+
+- keeps iterating locally
+- records the best pending candidates
+- carries forward the last known public metrics
+- uses local CV to triage ideas
+- resumes leaderboard validation when submissions reopen
+
+### Local GPU Use
+
+The generated Kaggle path detects the best local accelerator it can find and exports `LOCAL_ACCELERATOR`.
+
+Current detection covers:
+
+- CUDA
+- ROCm
+- MPS
+- CPU fallback
+
+That lets the agent keep running heavier local experiments while waiting for the next Kaggle submission window.
+
+## Kaggle Prerequisites
+
+Install the Kaggle CLI:
 
 ```bash
 pip install kaggle
 ```
 
-Preferred auth is environment-backed. The generated `autoresearch.sh` loads `${KAGGLE_ENV_FILE:-.env}` automatically and supports these inputs:
+Preferred auth is environment-backed. The generated script loads `${KAGGLE_ENV_FILE:-.env}` automatically.
+
+Supported credential patterns:
 
 ```bash
 KAGGLE_USERNAME=your_username
 KAGGLE_KEY=your_token
 ```
 
-It also accepts:
+Also supported:
 
 - `KAGGLE_API_TOKEN` as an alias for `KAGGLE_KEY`
 - `KAGGLE_TOKEN_FILE=/path/to/access_token` together with `KAGGLE_USERNAME`
-- fallback legacy `~/.kaggle/kaggle.json`
+- legacy fallback `~/.kaggle/kaggle.json`
 
 Example `.env`:
 
@@ -199,52 +288,69 @@ KAGGLE_API_TOKEN=your_token
 LEADERBOARD_TEAM_NAME=your_team_name
 ```
 
-If you still use the legacy file flow:
+Legacy file flow:
 
 ```bash
 mkdir -p ~/.kaggle
-# Put kaggle.json in ~/.kaggle/kaggle.json and chmod 600 it
 chmod 600 ~/.kaggle/kaggle.json
 ```
 
-Also accept the competition rules on Kaggle before the first download or submission. The generated scripts fail fast if auth is missing, the rules were not accepted, the submission quota is exhausted, or the kernel outputs do not contain the expected submission file.
+Before the first real submission:
 
----
+- authenticate the CLI
+- accept the competition rules
+- confirm the competition mode
+- confirm how a new score is supposed to appear
 
-## How it works
+## Example Domains
 
-The **extension** is domain-agnostic infrastructure. The **skills** encode domain knowledge. This separation means one extension serves unlimited domains, including Kaggle competition loops.
+| Domain | Metric | Command |
+|---|---|---|
+| Test speed | seconds ↓ | `pnpm test` |
+| Bundle size | KB ↓ | `pnpm build && du -sb dist` |
+| LLM training | val_bpb ↓ | `uv run train.py` |
+| Build speed | seconds ↓ | `pnpm build` |
+| Lighthouse | perf score ↑ | `lighthouse http://localhost:3000 --output=json` |
+| Kaggle competition | public rank ↓ | `./autoresearch.sh --submit` |
 
+## How It Works
+
+The extension is intentionally generic. The skills carry the domain logic.
+
+```text
+Extension:
+  run_experiment
+  log_experiment
+  widget + dashboard
+  autoresearch mode
+
+Generic skill:
+  command: pnpm test
+  metric: seconds
+  scope: code and config
+
+Kaggle skill:
+  command: ./autoresearch.sh --submit
+  metric: public_rank
+  scope: notebook, assets, submission flow, competition rules
 ```
-┌──────────────────────┐     ┌──────────────────────────┐
-│  Extension (global)  │     │  Skill (per-domain)       │
-│                      │     │                           │
-│  run_experiment      │◄────│  command: pnpm test       │
-│  log_experiment      │     │  metric: seconds (lower)  │
-│  widget + dashboard  │     │  scope: vitest configs    │
-│                      │     │  ideas: pool, parallel…   │
-├──────────────────────┤     ├──────────────────────────┤
-│  run_experiment      │◄────│  command: ./autoresearch.sh --submit │
-│  log_experiment      │     │  metric: public_rank (lower)         │
-│  widget + dashboard  │     │  scope: notebook.py, metadata        │
-│                      │     │  ideas: folds, blending, datasets…   │
-└──────────────────────┘     └──────────────────────────┘
+
+This keeps one infrastructure layer and multiple domain playbooks.
+
+## Session Persistence
+
+Two files are the backbone of resume behavior:
+
+```text
+autoresearch.jsonl   append-only run history
+autoresearch.md      objective, constraints, ideas, and experiment memory
 ```
 
-Two files keep the session alive across restarts and context resets:
+A fresh agent can read these and continue.
 
-```
-autoresearch.jsonl   — append-only log of every run (metric, status, commit, description)
-autoresearch.md      — living document: objective, what's been tried, dead ends, key wins
-```
+## Configuration
 
-A fresh agent with no memory can read these two files and continue exactly where the previous session left off.
-
----
-
-## Configuration (optional)
-
-Create `autoresearch.config.json` in your pi session directory to customize behavior:
+Optional `autoresearch.config.json`:
 
 ```json
 {
@@ -254,33 +360,28 @@ Create `autoresearch.config.json` in your pi session directory to customize beha
 ```
 
 | Field | Type | Description |
-|-------|------|-------------|
-| `workingDir` | string | Override the directory for all autoresearch operations — file I/O, command execution, and git. Supports absolute or relative paths (resolved against the pi session cwd). The config file itself always stays in the session cwd. Fails if the directory doesn't exist. |
-| `maxIterations` | number | Maximum experiments before auto-stopping. The agent is told to stop and won't run more experiments until a new segment is initialized. |
+|---|---|---|
+| `workingDir` | string | Override the directory used for autoresearch files, command execution, and git operations |
+| `maxIterations` | number | Maximum experiments before auto-stop |
 
----
+## Backpressure Checks
 
-## Backpressure checks (optional)
+If `autoresearch.checks.sh` exists, it runs after every passing experiment command.
 
-Create `autoresearch.checks.sh` to run correctness checks (tests, types, lint) after every passing experiment command. This ensures optimizations don't break things.
+Typical use:
 
-```bash
-#!/bin/bash
-set -euo pipefail
-pnpm test --run
-pnpm typecheck
-```
+- tests
+- type checks
+- lint
+- submission schema validation
+- Kaggle packaging validation
+- offline dependency checks
 
-**How it works:**
+If checks fail:
 
-- If the file doesn't exist, everything behaves exactly as before — no changes to the loop.
-- If it exists, it runs automatically after every experiment command that exits 0.
-- Checks execution time does **not** affect the primary metric.
-- If checks fail, the experiment is logged as `checks_failed` (same behavior as a crash — no commit, revert changes).
-- The `checks_failed` status is shown separately in the dashboard so you can distinguish correctness failures from experiment crashes.
-- Checks have a separate timeout (default 300s, configurable via `checks_timeout_seconds` in `run_experiment`).
-
----
+- the run is logged as `checks_failed`
+- the change is not kept
+- autoresearch files are preserved
 
 ## License
 
