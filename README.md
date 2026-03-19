@@ -273,31 +273,31 @@ That lets the agent keep running heavier local experiments while waiting for the
 
 ## Kaggle Prerequisites
 
-Install the Kaggle CLI:
+Install the Kaggle CLI on the host so `kaggle` is available on `PATH` for the generated shell scripts:
 
 ```bash
-pip install kaggle
+python3 -m pip install --user kaggle
 ```
+
+Use the CLI directly for auth, pushes, status checks, output download, and submissions. Do not replace the submission flow with project-local Python packages or wrappers.
 
 Preferred auth is environment-backed. The generated script loads `${KAGGLE_ENV_FILE:-.env}` automatically.
 
 Supported credential patterns:
 
 ```bash
-KAGGLE_USERNAME=your_username
-KAGGLE_KEY=your_token
+KAGGLE_API_TOKEN=your_token
 ```
 
 Also supported:
 
-- `KAGGLE_API_TOKEN` as an alias for `KAGGLE_KEY`
-- `KAGGLE_TOKEN_FILE=/path/to/access_token` together with `KAGGLE_USERNAME`
+- `KAGGLE_TOKEN_FILE=/path/to/access_token`
+- `~/.kaggle/access_token`
 - legacy fallback `~/.kaggle/kaggle.json`
 
 Example `.env`:
 
 ```bash
-KAGGLE_USERNAME=your_username
 KAGGLE_API_TOKEN=your_token
 LEADERBOARD_TEAM_NAME=your_team_name
 ```
@@ -315,6 +315,7 @@ Before the first real submission:
 - accept the competition rules
 - confirm the competition mode
 - confirm how a new score is supposed to appear
+- set `LEADERBOARD_TEAM_NAME` only if automatic leaderboard matching needs an explicit team/display name
 
 ## Example Domains
 

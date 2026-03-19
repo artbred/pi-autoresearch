@@ -13,6 +13,11 @@ Autonomous Kaggle competition loop: research the competition, build stronger not
 - **`run_experiment`** — run `./autoresearch.sh --local-only` for preflight work, obviously weak candidates, and quota-exhausted phases. When a valid candidate exists and submission quota is available, prefer `./autoresearch.sh --submit` so the loop keeps getting real leaderboard feedback.
 - **`log_experiment`** — record every run. Always include `public_score`, `cv_score`, and `submission_count` in the `metrics` dict.
 
+Use the host `kaggle` CLI directly for auth, pushes, kernel status, output download, leaderboard refresh, and competition submission.
+
+- If `kaggle` is missing from `PATH`, install the CLI outside the project environment so the executable is available to shell scripts.
+- Do not replace the submission flow with Python helper packages such as `kagglehub`; keep submission and scoring mechanics on the CLI path.
+
 ## Mandatory Inputs
 
 Ask or infer these before writing files:
@@ -155,7 +160,7 @@ This is the Kaggle loop entrypoint. It must support:
 - `./autoresearch.sh --submit`
   - Treat the current template as the default hybrid/file-upload path unless the competition rules require notebook-only submission.
   - Run the local path first.
-  - Verify Kaggle CLI auth and accepted rules.
+  - Verify the host `kaggle` CLI is installed, authenticated, and accepted into the competition rules.
   - If the daily submission cap is exhausted, do **not** stop:
     - queue the candidate for the next submission window
     - emit the last known public metrics plus the current `cv_score`
@@ -183,9 +188,11 @@ Do **not** fail-stop on the daily submission cap. When the cap is reached, switc
 
 Credential sources should be tried in this order:
 
-1. `KAGGLE_USERNAME` + `KAGGLE_KEY` from the environment or a sourced `.env` file.
-2. `KAGGLE_USERNAME` plus `KAGGLE_API_TOKEN` or `KAGGLE_TOKEN_FILE` / `access_token`.
-3. `~/.kaggle/kaggle.json` as a fallback for legacy setups.
+1. `${KAGGLE_ENV_FILE:-.env}` or environment with `KAGGLE_API_TOKEN`.
+2. `KAGGLE_TOKEN_FILE` or `~/.kaggle/access_token` / `access_token.txt`.
+3. `~/.kaggle/kaggle.json` as a legacy fallback only.
+
+Do not require `KAGGLE_USERNAME` for the primary auth path. Only set `LEADERBOARD_TEAM_NAME` when score lookup needs an explicit team or display name.
 
 ### `autoresearch.checks.sh`
 

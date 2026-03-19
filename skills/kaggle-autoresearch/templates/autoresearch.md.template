@@ -85,6 +85,8 @@ Win the Kaggle competition `__COMPETITION_SLUG__` by iterating on notebook submi
 - `submission.csv` required after notebook run: __SUBMISSION_FILE_REQUIREMENT__
 - How a new score appears: __SCORE_REFRESH_NOTES__
 - Competition-specific upload edge cases: __UPLOAD_EDGE_CASES__
+- CLI policy: use the host `kaggle` executable for submit / push / status / output flow, not Python submission wrappers.
+- Auth policy: store only `KAGGLE_API_TOKEN` in `${KAGGLE_ENV_FILE:-.env}` for the primary path; add `LEADERBOARD_TEAM_NAME` only if leaderboard lookup needs an explicit display name.
 
 ## Local Validation Strategy
 - Validation metric: `__CV_METRIC_NAME__`

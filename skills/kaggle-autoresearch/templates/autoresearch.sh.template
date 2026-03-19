@@ -62,11 +62,6 @@ load_env_file_if_present() {
 load_kaggle_auth() {
   load_env_file_if_present
 
-  if [[ -n "${KAGGLE_USERNAME_FILE:-}" && -z "${KAGGLE_USERNAME:-}" && -f "${KAGGLE_USERNAME_FILE}" ]]; then
-    export KAGGLE_USERNAME
-    KAGGLE_USERNAME="$(tr -d '\r\n' < "${KAGGLE_USERNAME_FILE}")"
-  fi
-
   if [[ -n "${KAGGLE_API_TOKEN:-}" && -z "${KAGGLE_KEY:-}" ]]; then
     export KAGGLE_KEY
     KAGGLE_KEY="${KAGGLE_API_TOKEN}"
@@ -88,15 +83,20 @@ load_kaggle_auth() {
     done
   fi
 
-  if [[ -n "$token_file" && -z "${KAGGLE_KEY:-}" ]]; then
+  if [[ -n "$token_file" && -z "${KAGGLE_API_TOKEN:-}" ]]; then
+    export KAGGLE_API_TOKEN
+    KAGGLE_API_TOKEN="$(tr -d '\r\n' < "$token_file")"
+  fi
+
+  if [[ -n "${KAGGLE_API_TOKEN:-}" && -z "${KAGGLE_KEY:-}" ]]; then
     export KAGGLE_KEY
-    KAGGLE_KEY="$(tr -d '\r\n' < "$token_file")"
+    KAGGLE_KEY="${KAGGLE_API_TOKEN}"
   fi
 }
 
 resolve_leaderboard_team_name() {
   if [[ -z "${LEADERBOARD_TEAM_NAME:-}" ]]; then
-    LEADERBOARD_TEAM_NAME="${KAGGLE_USERNAME:-$KERNEL_OWNER}"
+    LEADERBOARD_TEAM_NAME="${KERNEL_OWNER}"
   fi
 }
 
@@ -260,15 +260,15 @@ require_kaggle_auth() {
   load_kaggle_auth
   resolve_leaderboard_team_name
 
-  if [[ -n "${KAGGLE_KEY:-}" && -z "${KAGGLE_USERNAME:-}" && ! -f "$legacy_json_path" ]]; then
-    die "Kaggle token found, but KAGGLE_USERNAME is missing. Set KAGGLE_USERNAME in the environment, ${KAGGLE_ENV_FILE:-.env}, or keep using ${legacy_json_path}."
-  fi
-
-  if [[ -n "${KAGGLE_USERNAME:-}" && -n "${KAGGLE_KEY:-}" ]]; then
+  if [[ -n "${KAGGLE_API_TOKEN:-}" || -n "${KAGGLE_KEY:-}" ]]; then
     return 0
   fi
 
-  [[ -f "$legacy_json_path" ]] || die "Missing Kaggle credentials. Supported sources: KAGGLE_USERNAME/KAGGLE_KEY in the environment, ${KAGGLE_ENV_FILE:-.env}, KAGGLE_TOKEN_FILE or access_token, or ${legacy_json_path}."
+  if [[ -f "$legacy_json_path" ]]; then
+    return 0
+  fi
+
+  die "Missing Kaggle credentials. Supported sources: ${KAGGLE_ENV_FILE:-.env} with KAGGLE_API_TOKEN, KAGGLE_TOKEN_FILE or access_token, or legacy ${legacy_json_path}."
 }
 
 verify_competition_access() {
@@ -416,7 +416,7 @@ download_leaderboard_csv() {
 extract_public_metrics() {
   local leaderboard_csv="$1"
   local submissions_csv="$2"
-  python3 - "$leaderboard_csv" "$submissions_csv" "$LEADERBOARD_TEAM_NAME" "${KAGGLE_USERNAME:-$KERNEL_OWNER}" <<'PY'
+  python3 - "$leaderboard_csv" "$submissions_csv" "$LEADERBOARD_TEAM_NAME" "$KERNEL_OWNER" <<'PY'
 import csv
 import json
 import sys
@@ -450,7 +450,7 @@ for row in leaderboard_rows:
 if match is None:
     raise SystemExit(
         "Could not find the configured team on the downloaded leaderboard. "
-        "Set LEADERBOARD_TEAM_NAME to the exact team name if it differs from the Kaggle username."
+        "Set LEADERBOARD_TEAM_NAME to the exact team or display name used on the leaderboard."
     )
 
 submissions_rows = []
