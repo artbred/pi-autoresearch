@@ -246,6 +246,12 @@ Instead it:
 - uses local CV to triage ideas
 - resumes leaderboard validation when submissions reopen
 
+But local-only work is not supposed to be the default steady state while submissions are still available:
+
+- get a real public baseline as soon as the submission path works
+- periodically submit the best compliant candidate for a real score
+- iterate on top of refreshed leaderboard feedback, not just on CV-only changes
+
 The generated notebook and scripts also treat notebook runtime as a hard gate:
 
 - the notebook records wall-clock runtime

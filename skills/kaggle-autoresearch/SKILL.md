@@ -10,7 +10,7 @@ Autonomous Kaggle competition loop: research the competition, build stronger not
 ## Tools
 
 - **`init_experiment`** — initialize the session with `metric_name="public_rank"` and `direction="lower"`.
-- **`run_experiment`** — run `./autoresearch.sh --local-only` for preflight work and quota-exhausted phases, or `./autoresearch.sh --submit` for a leaderboard-tracked iteration.
+- **`run_experiment`** — run `./autoresearch.sh --local-only` for preflight work, obviously weak candidates, and quota-exhausted phases. When a valid candidate exists and submission quota is available, prefer `./autoresearch.sh --submit` so the loop keeps getting real leaderboard feedback.
 - **`log_experiment`** — record every run. Always include `public_score`, `cv_score`, and `submission_count` in the `metrics` dict.
 
 ## Mandatory Inputs
@@ -59,6 +59,7 @@ Treat notebook runtime as a hard constraint, not a soft preference:
    - Start with `./autoresearch.sh --local-only` to confirm the notebook builds and the local pipeline writes the submission artifact and `cv_score`.
    - Once the submission path is valid, run the competition-mode-specific submission flow to establish the first public rank baseline.
    - Confirm the measured local wall-clock runtime stays inside the notebook execution budget with the configured safety margin before treating the candidate as submission-ready.
+   - Do not stay in `--local-only` mode once the first legal scored submission is available; get a real score early and iterate from that public feedback.
 9. Detect local acceleration early:
    - Check for CUDA, ROCm, or MPS on the current machine.
    - If a GPU is available, bias local training, ensembling, and notebook execution toward using it during long local iteration phases.
@@ -212,6 +213,11 @@ Use when the user requires correctness or rules backpressure. The checks must va
 - `--local-only` runs are preflight checks, not proof of leaderboard improvement.
   - Carry forward the last known public metrics or a large placeholder rank until the first real submission.
   - Use local CV to decide whether a candidate is worth spending a Kaggle submission on.
+- Local-only iteration must not become the steady-state loop when submission slots are still available.
+  - Establish a real public baseline as soon as the submission path works.
+  - When quota remains, periodically submit the strongest legal, runtime-safe candidate instead of endlessly accumulating local-only improvements.
+  - If multiple promising local iterations have passed without a fresh public score, force a scored submission of the best current candidate and continue iterating from that scored result.
+  - Keep the pending submission queue short while quota is available; it exists for quota exhaustion or brief staging, not for indefinite local-only drift.
 - When the daily submission limit is exhausted:
   - Do not stop.
   - Continue with `--local-only` experiments, discussion mining, feature work, and ensembling.

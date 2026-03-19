@@ -74,6 +74,7 @@ Win the Kaggle competition `__COMPETITION_SLUG__` by iterating on notebook submi
 ## Submission Budget
 - Daily submission cap: __SUBMISSION_CAP__
 - Operating policy: use `--local-only` for triage, reserve `--submit` for notebook variants with a real CV or robustness story.
+- Real-score policy: establish a public baseline early, and when quota is available do not let the loop sit in `--local-only` mode for long stretches without submitting the best compliant candidate for scoring.
 - Current reserve policy: __SUBMISSION_POLICY__
 - When the cap is reached, do not stop the loop. Continue local iterations, write the strongest candidates to the pending submission queue, and resume leaderboard validation when the window reopens.
 - Local accelerator strategy: detect CUDA / ROCm / MPS and use GPU-backed runs whenever the machine supports them.
@@ -114,7 +115,8 @@ Win the Kaggle competition `__COMPETITION_SLUG__` by iterating on notebook submi
 | baseline | __BASELINE_PUBLIC_RANK__ | __BASELINE_PUBLIC_SCORE__ | __BASELINE_CV_SCORE__ | __BASELINE_NOTES__ |
 
 ## Pending Submission Queue
-- Track the best local-only candidates here whenever the daily submission cap is exhausted.
+- Track the best local-only candidates here whenever the daily submission cap is exhausted or a submission is briefly staged for the next score refresh.
+- Do not let this queue become a substitute for real scoring while submission quota is still available.
 - Note the notebook variant, `cv_score`, robustness story, and why it should be first in line once submissions reopen.
 
 ## What's Been Tried
