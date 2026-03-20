@@ -10,10 +10,11 @@ Autonomous Kaggle competition loop: research the competition, build stronger not
 ## Tools
 
 - **`init_experiment`** — initialize the session with `metric_name="public_rank"` and `direction="lower"`.
-- **`run_experiment`** — run lane-attributed experiments. In parallel mode, use `lane_id` (`exploit`, `explore`, `merge`) and a stable `strategy_id` on every call. Use `./autoresearch.sh --local-only` for preflight work, obviously weak candidates, merge builds, and quota-exhausted phases. When a valid candidate exists and submission quota is available, prefer `./autoresearch.sh --submit` or `./autoresearch.sh --submit-candidate <candidate-id>` so the loop keeps getting real leaderboard feedback.
+- **`run_experiment`** — run lane-attributed experiments. In parallel mode, use `lane_id` (`exploit`, `explore`, `merge`) and a stable `strategy_id` on every call. Use `./autoresearch.sh --local-only` for preflight work, obviously weak candidates, merge builds, and quota-exhausted phases. When a valid candidate exists and submission quota is available, prefer `./autoresearch.sh --submit`, `./autoresearch.sh --submit-candidate <candidate-id>`, and `./autoresearch.sh --refresh-score` so the loop keeps getting real leaderboard feedback without blocking on Kaggle waits.
 - **`log_experiment`** — record every run. Always include `public_score`, `cv_score`, and `submission_count` in the `metrics` dict. Keep-worthy variants should carry `candidate_id`; set `action_type`, `score_state`, and `provisional` accurately so the extension can enforce freshness policies.
 
 Use the host `kaggle` CLI directly for auth, pushes, kernel status, output download, leaderboard refresh, and competition submission.
+The generated template now defaults notebook-version score requests to `kaggle notebook-score`. Override `KAGGLE_NOTEBOOK_SCORE_CMD` only when a competition needs a different Kaggle-native scoring call or extra arguments.
 
 - If `kaggle` is missing from `PATH`, install the CLI outside the project environment so the executable is available to shell scripts.
 - Do not replace the submission flow with Python helper packages such as `kagglehub`; keep submission and scoring mechanics on the CLI path.
@@ -87,7 +88,8 @@ Before assuming anything about upload or score retrieval, classify the competiti
 
 - The notebook version itself is the submission artifact.
 - Do **not** assume `kaggle competitions submit` is the right path.
-- Push the notebook, create a scored notebook version, and use the notebook submission flow defined by the competition.
+- Push the notebook, wait for that exact version to finish, then request competition scoring for that exact completed version.
+- A notebook push alone is not a scored submission.
 - The score appears only after the notebook version finishes running and Kaggle evaluates that run.
 
 ### 3. Hybrid notebook-plus-file competitions
@@ -113,6 +115,7 @@ Before assuming anything about upload or score retrieval, classify the competiti
 ## Edge Cases To Handle Explicitly
 
 - Some competitions score uploaded files, some score notebook versions, and some require both. Never guess.
+- Some notebook competitions have two distinct submission surfaces: notebook run first, competition scoring second. Track them as separate states.
 - Some competitions disable internet. Dependency packaging, wheel uploads, and mounted install paths become part of the core submission workflow.
 - Some competitions require custom wheels or private libraries. Upload them as datasets and install from the mounted path inside the notebook.
 - Some competitions require a very strict `submission.csv` schema or row ordering. Validate this in `autoresearch.checks.sh`.
@@ -161,23 +164,31 @@ This is the Kaggle loop entrypoint. It must support:
     - `submission_count`
 - `./autoresearch.sh --submit`
   - Treat the current template as the default hybrid/file-upload path unless the competition rules require notebook-only submission.
-  - Run the local path first.
+  - Run the local path first when a fresh candidate still needs to be built.
   - Verify the host `kaggle` CLI is installed, authenticated, and accepted into the competition rules.
+  - Return quickly after initiating the next Kaggle step. Do not block inside long polling loops.
   - If the daily submission cap is exhausted, do **not** stop:
     - queue the candidate for the next submission window
     - emit the last known public metrics plus the current `cv_score`
     - continue iterating locally
   - If the competition is hybrid/file-upload:
-    - push the notebook
-    - wait for notebook completion
+    - push the notebook and record the exact notebook version/run identifiers
+    - later, on `--refresh-score`, detect notebook completion
     - collect `submission.csv`
-    - submit the file to the competition
+    - then submit the file to the competition
   - If the competition is notebook-only/code-submission:
-    - replace the submit path so the notebook version itself becomes the scored submission
-    - do not force `kaggle competitions submit`
-  - Refresh the correct score surface for the chosen mode and emit the same metric set
+    - push the notebook and record the exact notebook version/run identifiers
+    - on `--refresh-score`, wait for that exact version to complete, then request competition scoring for that exact version
+    - do not treat a notebook push as a real score
+- `./autoresearch.sh --refresh-score [candidate-id|--all-pending]`
+  - Advance one pending Kaggle state without blocking:
+    - notebook submitted -> notebook still running or complete
+    - notebook complete -> request notebook scoring or submit generated file
+    - score requested -> poll submissions / leaderboard until `public_scored`
+  - Prefer short refresh calls between new local experiments instead of sleeping for completion in one run
 - `./autoresearch.sh --submit-candidate <candidate-id>`
   - Submit an already-built queued candidate deterministically instead of resubmitting whichever local artifact happened to be newest.
+  - For notebook-scored or hybrid competitions, use the candidate’s stored notebook snapshot, not whichever notebook version is newest in the working tree.
 - `./autoresearch.sh --merge-candidates <candidate-id[,candidate-id...]>`
   - Build an artifact-level merge candidate, prefer ensembling compatible submissions, and record the merge inputs in the candidate manifest.
 
@@ -217,6 +228,7 @@ Use when the user requires correctness or rules backpressure. The checks must va
 - Treat public leaderboard position as the primary objective.
 - Never stall:
   - every loop segment must produce a new candidate, a fresh public score, or an explicitly provisional keep during a submission blackout
+  - a pending notebook run or pending score request is useful work in flight, but it is not a fresh public score
   - do not spend long stretches in local-only drift without queueing or scoring anything new
 - In parallel mode:
   - use `exploit` for the best scored line
@@ -240,6 +252,7 @@ Use when the user requires correctness or rules backpressure. The checks must va
   - If multiple promising local iterations have passed without a fresh public score, force a scored submission of the best current candidate and continue iterating from that scored result.
   - Keep the pending submission queue short while quota is available; it exists for quota exhaustion or brief staging, not for indefinite local-only drift.
   - If the extension says a fresh score is required, the next admissible action is a scored submission or score refresh, not another local-only run.
+  - Do not sit inside `--submit` waiting for Kaggle. Use `--refresh-score` in short bursts while other lanes keep exploring.
 - When the daily submission limit is exhausted:
   - Do not stop.
   - Continue with `--local-only` experiments, discussion mining, feature work, and ensembling.

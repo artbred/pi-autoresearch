@@ -126,6 +126,95 @@ test("orchestrator forces a scored submission after repeated local keeps", () =>
   assert.equal(orchestrator.policy.localKeepsWithoutScore, 0);
 });
 
+test("pending Kaggle score work suppresses duplicate forced-submit pressure", () => {
+  const cwd = path.resolve("/tmp", "pi-autoresearch-pending");
+  const settings = resolveAutoresearchConfig(cwd, {});
+  const orchestrator = createOrchestratorState({
+    workDir: settings.workingDir,
+    stateDir: settings.stateDir,
+    worktreeRoot: settings.parallelism.worktreeRoot,
+    branchPrefix: "demo",
+    settings,
+    backend: resolveWorkerBackend("none", false),
+  });
+
+  for (let index = 1; index <= 3; index += 1) {
+    applyExperimentToOrchestrator(orchestrator, {
+      laneId: "exploit",
+      strategyId: "exploit-v1",
+      candidateId: `cand-${index}`,
+      metric: 100 - index,
+      metrics: { cv_score: 0.4 + index / 10 },
+      status: "keep",
+      description: `candidate ${index}`,
+      timestamp: index * 1000,
+      actionType: "local_only",
+      scoreState: "local_only",
+    });
+  }
+
+  assert.equal(orchestrator.policy.forcedSubmitRequired, true);
+
+  applyExperimentToOrchestrator(orchestrator, {
+    laneId: "exploit",
+    strategyId: "exploit-v1",
+    candidateId: "cand-3",
+    metric: 97,
+    metrics: { cv_score: 0.73 },
+    status: "keep",
+    description: "submitted and pending",
+    timestamp: 5000,
+    actionType: "submit_notebook",
+    scoreState: "notebook_run_running",
+  });
+
+  assert.equal(orchestrator.activeScoreCandidateId, "cand-3");
+  assert.equal(orchestrator.policy.forcedSubmitRequired, false);
+  assert.equal(
+    getRunBlockReason(
+      orchestrator,
+      "./autoresearch.sh --local-only",
+      "explore",
+      "alt-hypothesis"
+    ),
+    null
+  );
+
+  applyExperimentToOrchestrator(orchestrator, {
+    laneId: "exploit",
+    strategyId: "exploit-v1",
+    candidateId: "cand-3",
+    metric: 96,
+    metrics: { cv_score: 0.73 },
+    status: "keep",
+    description: "still pending after refresh",
+    timestamp: 6000,
+    actionType: "refresh_score",
+    scoreState: "score_pending",
+  });
+
+  assert.equal(orchestrator.policy.lastFreshPublicScoreAt, null);
+  assert.equal(orchestrator.activeScoreCandidateId, "cand-3");
+
+  applyExperimentToOrchestrator(orchestrator, {
+    laneId: "exploit",
+    strategyId: "exploit-v1",
+    candidateId: "cand-3",
+    metric: 95,
+    metrics: { cv_score: 0.73, public_score: 0.55 },
+    status: "keep",
+    description: "public score landed",
+    timestamp: 7000,
+    actionType: "refresh_score",
+    scoreState: "public_scored",
+    publicMetricsTimestamp: 7000,
+  });
+
+  assert.equal(orchestrator.activeScoreCandidateId, null);
+  assert.equal(orchestrator.policy.forcedSubmitRequired, false);
+  assert.equal(orchestrator.policy.lastFreshPublicScoreAt, 7000);
+});
+
 test("orchestrator forces lane rotation after repeated non-improving runs", () => {
   const state = createExperimentState();
   const settings = resolveAutoresearchConfig(path.resolve("/tmp", "lanes"), {});

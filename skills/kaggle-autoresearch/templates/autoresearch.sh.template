@@ -8,6 +8,8 @@ cd "$ROOT_DIR"
 
 COMPETITION_SLUG="${COMPETITION_SLUG:-__COMPETITION_SLUG__}"
 COMPETITION_URL="${COMPETITION_URL:-__COMPETITION_URL__}"
+COMPETITION_MODE="${COMPETITION_MODE:-hybrid}"
+KAGGLE_SCORE_BACKEND="${KAGGLE_SCORE_BACKEND:-kaggle_native}"
 KERNEL_OWNER="${KERNEL_OWNER:-__KERNEL_OWNER__}"
 KERNEL_SLUG="${KERNEL_SLUG:-__KERNEL_SLUG__}"
 KERNEL_REF="${KERNEL_OWNER}/${KERNEL_SLUG}"
@@ -26,13 +28,17 @@ CANDIDATES_DIR="${CANDIDATES_DIR:-outputs/candidates}"
 PLACEHOLDER_PUBLIC_RANK="${PLACEHOLDER_PUBLIC_RANK:-999999}"
 PLACEHOLDER_PUBLIC_SCORE="${PLACEHOLDER_PUBLIC_SCORE:-0}"
 MAX_DAILY_SUBMISSIONS="${MAX_DAILY_SUBMISSIONS:-__SUBMISSION_CAP__}"
-KERNEL_STATUS_POLL_SECONDS="${KERNEL_STATUS_POLL_SECONDS:-20}"
-KERNEL_STATUS_MAX_POLLS="${KERNEL_STATUS_MAX_POLLS:-45}"
-POST_SUBMIT_SLEEP_SECONDS="${POST_SUBMIT_SLEEP_SECONDS:-10}"
+KAGGLE_NOTEBOOK_POLL_SECONDS="${KAGGLE_NOTEBOOK_POLL_SECONDS:-20}"
+KAGGLE_SCORE_POLL_SECONDS="${KAGGLE_SCORE_POLL_SECONDS:-15}"
+KAGGLE_PENDING_TIMEOUT_MINUTES="${KAGGLE_PENDING_TIMEOUT_MINUTES:-180}"
 NOTEBOOK_RUNTIME_LIMIT_SECONDS="${NOTEBOOK_RUNTIME_LIMIT_SECONDS:-__NOTEBOOK_RUNTIME_LIMIT_SECONDS__}"
 NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS="${NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS:-__NOTEBOOK_RUNTIME_SAFETY_MARGIN_SECONDS__}"
 NOTEBOOK_RUNTIME_BUDGET_SECONDS="${NOTEBOOK_RUNTIME_BUDGET_SECONDS:-__NOTEBOOK_RUNTIME_BUDGET_SECONDS__}"
 CV_DIRECTION="${CV_DIRECTION:-__CV_DIRECTION__}"
+
+KAGGLE_NOTEBOOK_PUSH_CMD="${KAGGLE_NOTEBOOK_PUSH_CMD:-}"
+KAGGLE_NOTEBOOK_IDENTITY_CMD="${KAGGLE_NOTEBOOK_IDENTITY_CMD:-}"
+KAGGLE_NOTEBOOK_SCORE_CMD="${KAGGLE_NOTEBOOK_SCORE_CMD:-kaggle notebook-score}"
 
 mkdir -p "$(dirname "$METRICS_FILE")" "$KERNEL_OUTPUT_DIR" "$CANDIDATES_DIR"
 CURRENT_SUBMISSION_COUNT=""
@@ -50,6 +56,20 @@ emit_metric() {
   local name="$1"
   local value="$2"
   echo "METRIC ${name}=${value}"
+}
+
+info() {
+  echo "INFO $*"
+}
+
+normalize_competition_mode() {
+  case "$COMPETITION_MODE" in
+    file_upload|notebook_scored|hybrid)
+      ;;
+    *)
+      die "Unsupported COMPETITION_MODE=${COMPETITION_MODE}. Use file_upload, notebook_scored, or hybrid."
+      ;;
+  esac
 }
 
 load_env_file_if_present() {
@@ -152,7 +172,7 @@ PY
 
 prepare_local_accelerator() {
   export LOCAL_ACCELERATOR="${LOCAL_ACCELERATOR:-$(detect_local_accelerator)}"
-  echo "INFO local_accelerator=${LOCAL_ACCELERATOR}"
+  info "local_accelerator=${LOCAL_ACCELERATOR}"
 }
 
 ensure_state_file() {
@@ -201,7 +221,39 @@ if not state_path.exists():
     raise SystemExit(0)
 
 payload = json.loads(state_path.read_text())
-print(payload.get(key, default_value))
+value = payload.get(key, default_value)
+if isinstance(value, (dict, list)):
+    print(json.dumps(value))
+else:
+    print(value)
+PY
+}
+
+persist_state() {
+  local public_rank="$1"
+  local public_score="$2"
+  local submission_count="$3"
+  local submission_path="$4"
+  local public_metrics_timestamp="${5:-0}"
+  local submission_id="${6:-}"
+  local candidate_id="${7:-}"
+
+  python3 - "$STATE_FILE" "$public_rank" "$public_score" "$submission_count" "$submission_path" "$public_metrics_timestamp" "$submission_id" "$candidate_id" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+state_path = Path(sys.argv[1])
+payload = {
+    "public_rank": float(sys.argv[2]),
+    "public_score": float(sys.argv[3]),
+    "submission_count": int(float(sys.argv[4])),
+    "last_submission_path": sys.argv[5],
+    "last_public_metrics_timestamp": int(float(sys.argv[6])) if sys.argv[6] not in ("", "0") else 0,
+    "last_submission_id": sys.argv[7],
+    "last_candidate_id": sys.argv[8],
+}
+state_path.write_text(json.dumps(payload, indent=2) + "\n")
 PY
 }
 
@@ -222,7 +274,11 @@ if not metrics_path.exists():
     raise SystemExit(0)
 
 payload = json.loads(metrics_path.read_text())
-print(payload.get(key, default_value))
+value = payload.get(key, default_value)
+if isinstance(value, (dict, list)):
+    print(json.dumps(value))
+else:
+    print(value)
 PY
 }
 
@@ -265,23 +321,35 @@ candidate_manifest_path() {
   printf '%s/manifest.json\n' "$(candidate_dir "$candidate_id")"
 }
 
-candidate_submission_file() {
-  local manifest
-  manifest="$(candidate_manifest_path "$1")"
-  python3 - "$manifest" "$SUBMISSION_FILE" <<'PY'
+candidate_manifest_value() {
+  local candidate_id="$1"
+  local key="$2"
+  local default_value="$3"
+  python3 - "$(candidate_manifest_path "$candidate_id")" "$key" "$default_value" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 manifest_path = Path(sys.argv[1])
-default_path = Path(sys.argv[2])
+key = sys.argv[2]
+default_value = sys.argv[3]
 if not manifest_path.exists():
-    raise SystemExit(f"Missing candidate manifest: {manifest_path}")
+    print(default_value)
+    raise SystemExit(0)
 
 payload = json.loads(manifest_path.read_text())
-submission_path = payload.get("submission_file") or str(default_path)
-print(submission_path)
+value = payload.get(key, default_value)
+if value is None:
+    value = default_value
+if isinstance(value, (dict, list)):
+    print(json.dumps(value))
+else:
+    print(value)
 PY
+}
+
+candidate_submission_file() {
+  candidate_manifest_value "$1" "submission_file" "$SUBMISSION_FILE"
 }
 
 candidate_metric_value() {
@@ -303,17 +371,35 @@ if not manifest_path.exists():
 payload = json.loads(manifest_path.read_text())
 metrics = payload.get("metrics") or {}
 value = metrics.get(metric_key, payload.get(metric_key, default_value))
-print(value)
+if value is None:
+    value = default_value
+if isinstance(value, (dict, list)):
+    print(json.dumps(value))
+else:
+    print(value)
 PY
+}
+
+clear_manifest_overrides() {
+  unset MANIFEST_SOURCE_SUBMISSION_FILE || true
+  unset MANIFEST_SOURCE_NOTEBOOK_FILE || true
+  unset MANIFEST_SOURCE_METRICS_FILE || true
+  unset MANIFEST_SUBMISSION_ARTIFACT_KIND || true
+  unset MANIFEST_KERNEL_VERSION_ID || true
+  unset MANIFEST_KERNEL_RUN_ID || true
+  unset MANIFEST_SCORE_REQUEST_ID || true
+  unset MANIFEST_SCORE_REQUESTED_AT || true
+  unset MANIFEST_KERNEL_REF || true
 }
 
 write_candidate_manifest() {
   local candidate_id="$1"
   local score_state="$2"
-  local merge_inputs="${3:-}"
+  local pending_next_action="${3:-}"
   local pending_priority="${4:-}"
   local public_metrics_timestamp="${5:-}"
   local submission_id="${6:-}"
+  local merge_inputs="${7:-}"
   local candidate_path
   candidate_path="$(candidate_dir "$candidate_id")"
   mkdir -p "$candidate_path"
@@ -322,15 +408,22 @@ write_candidate_manifest() {
     "$(candidate_manifest_path "$candidate_id")" \
     "$candidate_id" \
     "$score_state" \
-    "$merge_inputs" \
+    "$pending_next_action" \
     "$pending_priority" \
     "$public_metrics_timestamp" \
     "$submission_id" \
+    "$merge_inputs" \
+    "$ROOT_DIR" \
+    "$NOTEBOOK_IPYNB" \
     "$METRICS_FILE" \
-    "$STATE_FILE" \
     "$SUBMISSION_FILE" \
-    "${LOCAL_ACCELERATOR:-cpu}" <<'PY'
+    "$COMPETITION_MODE" \
+    "$KAGGLE_SCORE_BACKEND" \
+    "$KERNEL_REF" \
+    <<'PY'
 import json
+import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -338,53 +431,146 @@ from pathlib import Path
 manifest_path = Path(sys.argv[1])
 candidate_id = sys.argv[2]
 score_state = sys.argv[3]
-merge_inputs = [item for item in sys.argv[4].split(",") if item]
+pending_next_action = sys.argv[4]
 pending_priority = sys.argv[5]
 public_metrics_timestamp = sys.argv[6]
 submission_id = sys.argv[7]
-metrics_path = Path(sys.argv[8])
-state_path = Path(sys.argv[9])
-submission_file = sys.argv[10]
-local_accelerator = sys.argv[11]
+merge_inputs = [item for item in sys.argv[8].split(",") if item]
+root_dir = Path(sys.argv[9]).resolve()
+notebook_ipynb = sys.argv[10]
+metrics_file = sys.argv[11]
+submission_file = sys.argv[12]
+competition_mode = sys.argv[13]
+score_backend = sys.argv[14]
+kernel_ref = sys.argv[15]
 
 payload = {}
+if not manifest_path.is_absolute():
+    manifest_path = (root_dir / manifest_path).resolve()
 if manifest_path.exists():
     payload = json.loads(manifest_path.read_text())
 
-metrics = {}
-if metrics_path.exists():
-    metrics = json.loads(metrics_path.read_text())
-
 state = {}
+state_path = root_dir / os.environ.get("STATE_FILE", "outputs/kaggle_state.json")
 if state_path.exists():
     state = json.loads(state_path.read_text())
 
-artifact_paths = []
-for candidate in [submission_file, str(metrics_path)]:
-    if candidate and Path(candidate).exists():
-        artifact_paths.append(candidate)
+metrics = {}
+metrics_path = root_dir / metrics_file
+if metrics_path.exists():
+    metrics = json.loads(metrics_path.read_text())
+
+candidate_dir = manifest_path.parent
+artifacts_dir = candidate_dir / "artifacts"
+artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+def maybe_copy(source_value: str):
+    if not source_value:
+        return None
+    source = Path(source_value)
+    if not source.is_absolute():
+        source = root_dir / source
+    if not source.exists():
+        return None
+    destination = artifacts_dir / source.name
+    if source.resolve() != destination.resolve():
+        shutil.copyfile(source, destination)
+    return destination.relative_to(root_dir).as_posix()
+
+copied_submission = maybe_copy(os.environ.get("MANIFEST_SOURCE_SUBMISSION_FILE") or submission_file)
+copied_notebook = maybe_copy(os.environ.get("MANIFEST_SOURCE_NOTEBOOK_FILE") or notebook_ipynb)
+copied_metrics = maybe_copy(os.environ.get("MANIFEST_SOURCE_METRICS_FILE") or metrics_file)
+
+artifact_paths = list(payload.get("artifact_paths") or [])
+for value in (copied_submission, copied_notebook, copied_metrics):
+    if value and value not in artifact_paths:
+        artifact_paths.append(value)
+
+score_requested_at = os.environ.get("MANIFEST_SCORE_REQUESTED_AT") or payload.get("score_requested_at")
+if score_requested_at not in (None, "", "null"):
+    score_requested_at = int(float(score_requested_at))
+else:
+    score_requested_at = None
+
+pending_priority_value = payload.get("pending_priority")
+if pending_priority not in ("", None):
+    pending_priority_value = float(pending_priority)
+
+public_metrics_ts_value = payload.get("public_metrics_timestamp")
+if public_metrics_timestamp not in ("", "0", None):
+    public_metrics_ts_value = int(float(public_metrics_timestamp))
 
 payload.update(
     {
         "candidate_id": candidate_id,
         "updated_at": int(time.time()),
         "score_state": score_state,
-        "metrics": metrics,
-        "submission_file": submission_file,
-        "local_accelerator": local_accelerator,
+        "competition_mode": competition_mode,
+        "score_backend": score_backend,
+        "kernel_ref": os.environ.get("MANIFEST_KERNEL_REF") or payload.get("kernel_ref") or kernel_ref,
+        "kernel_version_id": os.environ.get("MANIFEST_KERNEL_VERSION_ID") or payload.get("kernel_version_id"),
+        "kernel_run_id": os.environ.get("MANIFEST_KERNEL_RUN_ID") or payload.get("kernel_run_id"),
+        "score_request_id": os.environ.get("MANIFEST_SCORE_REQUEST_ID") or payload.get("score_request_id"),
+        "score_requested_at": score_requested_at,
+        "submission_artifact_kind": os.environ.get("MANIFEST_SUBMISSION_ARTIFACT_KIND")
+        or payload.get("submission_artifact_kind")
+        or ("notebook_version" if competition_mode == "notebook_scored" else "file"),
+        "pending_next_action": pending_next_action or None,
+        "metrics": metrics or payload.get("metrics", {}),
+        "submission_file": copied_submission or payload.get("submission_file") or submission_file,
+        "notebook_ipynb": copied_notebook or payload.get("notebook_ipynb") or notebook_ipynb,
+        "metrics_file": copied_metrics or payload.get("metrics_file") or metrics_file,
+        "local_accelerator": os.environ.get("LOCAL_ACCELERATOR", "cpu"),
         "public_rank": state.get("public_rank"),
         "public_score": state.get("public_score"),
         "submission_count": state.get("submission_count"),
-        "public_metrics_timestamp": int(public_metrics_timestamp) if public_metrics_timestamp else payload.get("public_metrics_timestamp"),
+        "public_metrics_timestamp": public_metrics_ts_value,
         "submission_id": submission_id or payload.get("submission_id"),
-        "merge_inputs": merge_inputs,
-        "pending_priority": float(pending_priority) if pending_priority not in ("", None) else payload.get("pending_priority"),
+        "merge_inputs": merge_inputs or payload.get("merge_inputs", []),
+        "pending_priority": pending_priority_value,
         "artifact_paths": artifact_paths,
     }
 )
 payload.setdefault("created_at", int(time.time()))
 
 manifest_path.write_text(json.dumps(payload, indent=2) + "\n")
+PY
+}
+
+stage_candidate_kernel_dir() {
+  local candidate_id="$1"
+  python3 - "$(candidate_manifest_path "$candidate_id")" "$ROOT_DIR" "$NOTEBOOK_IPYNB" <<'PY'
+import json
+import shutil
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+root_dir = Path(sys.argv[2])
+notebook_name = Path(sys.argv[3]).name
+if not manifest_path.exists():
+    raise SystemExit(f"Missing candidate manifest: {manifest_path}")
+
+payload = json.loads(manifest_path.read_text())
+notebook_path = payload.get("notebook_ipynb")
+if not notebook_path:
+    raise SystemExit("Candidate manifest is missing notebook_ipynb.")
+
+source_notebook = Path(notebook_path)
+if not source_notebook.is_absolute():
+    source_notebook = root_dir / source_notebook
+if not source_notebook.exists():
+    raise SystemExit(f"Missing candidate notebook snapshot: {source_notebook}")
+
+stage_dir = manifest_path.parent / "kernel-staging"
+stage_dir.mkdir(parents=True, exist_ok=True)
+shutil.copyfile(source_notebook, stage_dir / notebook_name)
+
+metadata_path = root_dir / "kernel-metadata.json"
+if metadata_path.exists():
+    shutil.copyfile(metadata_path, stage_dir / "kernel-metadata.json")
+
+print(stage_dir)
 PY
 }
 
@@ -534,43 +720,17 @@ submission_budget_reached() {
   return 1
 }
 
-wait_for_kernel() {
-  local attempt
-  for (( attempt = 1; attempt <= KERNEL_STATUS_MAX_POLLS; attempt++ )); do
-    local status
-    status="$(kaggle kernels status "$KERNEL_REF" 2>&1 | tr -d '\r')"
-    echo "$status"
-    local lowered
-    lowered="$(echo "$status" | tr '[:upper:]' '[:lower:]')"
-    if [[ "$lowered" == *"complete"* ]]; then
-      return 0
-    fi
-    if [[ "$lowered" == *"fail"* || "$lowered" == *"error"* || "$lowered" == *"cancel"* || "$lowered" == *"invalid"* ]]; then
-      die "Kernel execution failed: $status"
-    fi
-    sleep "$KERNEL_STATUS_POLL_SECONDS"
-  done
-
-  die "Kernel did not complete after ${KERNEL_STATUS_MAX_POLLS} polls."
-}
-
 download_kernel_output() {
-  rm -rf "$KERNEL_OUTPUT_DIR"
-  mkdir -p "$KERNEL_OUTPUT_DIR"
-  kaggle kernels output "$KERNEL_REF" -p "$KERNEL_OUTPUT_DIR" -o -q >/dev/null
+  local output_dir="${1:-$KERNEL_OUTPUT_DIR}"
+  rm -rf "$output_dir"
+  mkdir -p "$output_dir"
+  kaggle kernels output "$KERNEL_REF" -p "$output_dir" -o -q >/dev/null
 
   local submission_name
   submission_name="$(basename "$SUBMISSION_FILE")"
-  local kernel_submission="${KERNEL_OUTPUT_DIR}/${submission_name}"
+  local kernel_submission="${output_dir}/${submission_name}"
   [[ -f "$kernel_submission" ]] || die "Kernel outputs did not contain ${submission_name}."
   echo "$kernel_submission"
-}
-
-submit_to_competition() {
-  local submission_path="$1"
-  local cv_score="$2"
-  local message="autoresearch $(date +%Y-%m-%dT%H:%M:%S) cv=${cv_score}"
-  kaggle competitions submit "$COMPETITION_SLUG" -f "$submission_path" -m "$message"
 }
 
 download_leaderboard_csv() {
@@ -639,31 +799,228 @@ print(json.dumps(payload))
 PY
 }
 
-persist_state() {
-  local public_rank="$1"
-  local public_score="$2"
-  local submission_count="$3"
-  local submission_path="$4"
-  local public_metrics_timestamp="${5:-0}"
-  local submission_id="${6:-}"
-  local candidate_id="${7:-}"
-
-  python3 - "$STATE_FILE" "$public_rank" "$public_score" "$submission_count" "$submission_path" "$public_metrics_timestamp" "$submission_id" "$candidate_id" <<'PY'
+extract_submission_record() {
+  local submissions_csv="$1"
+  local target_submission_id="${2:-}"
+  python3 - "$submissions_csv" "$target_submission_id" <<'PY'
+import csv
 import json
 import sys
 from pathlib import Path
 
-state_path = Path(sys.argv[1])
+path = Path(sys.argv[1])
+target_id = sys.argv[2]
+if not path.exists():
+    print(json.dumps({"found": False}))
+    raise SystemExit(0)
+
+rows = list(csv.DictReader(path.open(newline="")))
+if not rows:
+    print(json.dumps({"found": False}))
+    raise SystemExit(0)
+
+id_key = next((key for key in rows[0].keys() if "id" in key.lower()), None)
+score_key = next((key for key in rows[0].keys() if "score" in key.lower()), None)
+status_key = next((key for key in rows[0].keys() if "status" in key.lower()), None)
+
+matched = None
+if target_id and id_key:
+    for row in rows:
+        if (row.get(id_key) or "").strip() == target_id:
+            matched = row
+            break
+if matched is None:
+    matched = rows[0]
+
+submission_id = (matched.get(id_key) or "").strip() if id_key else ""
+score_raw = (matched.get(score_key) or "").strip() if score_key else ""
+status = (matched.get(status_key) or "").strip() if status_key else ""
+scored = score_raw not in ("", None)
+
 payload = {
-    "public_rank": float(sys.argv[2]),
-    "public_score": float(sys.argv[3]),
-    "submission_count": int(float(sys.argv[4])),
-    "last_submission_path": sys.argv[5],
-    "last_public_metrics_timestamp": int(float(sys.argv[6])) if sys.argv[6] not in ("", "0") else 0,
-    "last_submission_id": sys.argv[7],
-    "last_candidate_id": sys.argv[8],
+    "found": matched is not None,
+    "submission_id": submission_id,
+    "score": score_raw,
+    "status": status,
+    "scored": scored,
 }
-state_path.write_text(json.dumps(payload, indent=2) + "\n")
+print(json.dumps(payload))
+PY
+}
+
+extract_submission_id_from_output() {
+  local output="$1"
+  python3 - "$output" <<'PY'
+import json
+import re
+import sys
+
+text = sys.argv[1]
+value = None
+try:
+    payload = json.loads(text)
+    if isinstance(payload, dict):
+        value = payload.get("submission_id") or payload.get("id")
+except Exception:
+    pass
+
+if not value:
+    match = re.search(r"(sub-[A-Za-z0-9._-]+)", text)
+    if match:
+        value = match.group(1)
+
+print(value or "")
+PY
+}
+
+parse_kernel_status_payload() {
+  local raw_payload="$1"
+  python3 - "$raw_payload" <<'PY'
+import json
+import re
+import sys
+
+text = sys.argv[1].strip()
+payload = {}
+
+try:
+    parsed = json.loads(text)
+    if isinstance(parsed, dict):
+        payload = parsed
+except Exception:
+    payload = {}
+
+status = (
+    payload.get("status")
+    or payload.get("kernel_status")
+    or payload.get("run_status")
+    or text
+)
+status_text = str(status).lower()
+normalized = "unknown"
+if any(token in status_text for token in ("complete", "finished", "success", "done")):
+    normalized = "complete"
+elif any(token in status_text for token in ("fail", "error", "cancel", "invalid")):
+    normalized = "failed"
+elif any(token in status_text for token in ("run", "queue", "pending", "submit", "starting")):
+    normalized = "running"
+
+kernel_version_id = (
+    payload.get("kernel_version_id")
+    or payload.get("version_id")
+    or payload.get("versionId")
+    or ""
+)
+kernel_run_id = (
+    payload.get("kernel_run_id")
+    or payload.get("run_id")
+    or payload.get("runId")
+    or ""
+)
+
+if not kernel_version_id:
+    match = re.search(r"(kv-[A-Za-z0-9._-]+|version[_-]?id[:= ]+([A-Za-z0-9._-]+))", text, re.I)
+    if match:
+        kernel_version_id = match.group(1) if match.group(1).startswith("kv-") else match.group(2)
+if not kernel_run_id:
+    match = re.search(r"(kr-[A-Za-z0-9._-]+|run[_-]?id[:= ]+([A-Za-z0-9._-]+))", text, re.I)
+    if match:
+        kernel_run_id = match.group(1) if match.group(1).startswith("kr-") else match.group(2)
+
+print(json.dumps({
+    "status": normalized,
+    "kernel_version_id": kernel_version_id,
+    "kernel_run_id": kernel_run_id,
+    "raw": text,
+}))
+PY
+}
+
+fetch_kernel_status_once() {
+  local output
+  output="$(kaggle kernels status "$KERNEL_REF" 2>&1 | tr -d '\r')"
+  parse_kernel_status_payload "$output"
+}
+
+resolve_kernel_identity_after_push() {
+  local push_output="$1"
+  local parsed
+  parsed="$(parse_kernel_status_payload "$push_output")"
+  local kernel_version_id
+  local kernel_run_id
+  kernel_version_id="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("kernel_version_id",""))' <<<"$parsed")"
+  kernel_run_id="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("kernel_run_id",""))' <<<"$parsed")"
+
+  if [[ -z "$kernel_version_id" || -z "$kernel_run_id" ]]; then
+    if [[ -n "$KAGGLE_NOTEBOOK_IDENTITY_CMD" ]]; then
+      parsed="$(ROOT_DIR="$ROOT_DIR" COMPETITION_SLUG="$COMPETITION_SLUG" KERNEL_REF="$KERNEL_REF" bash -lc "$KAGGLE_NOTEBOOK_IDENTITY_CMD")"
+      kernel_version_id="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("kernel_version_id",""))' <<<"$parsed")"
+      kernel_run_id="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("kernel_run_id",""))' <<<"$parsed")"
+    else
+      parsed="$(fetch_kernel_status_once)"
+      kernel_version_id="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("kernel_version_id",""))' <<<"$parsed")"
+      kernel_run_id="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("kernel_run_id",""))' <<<"$parsed")"
+    fi
+  fi
+
+  python3 - "$kernel_version_id" "$kernel_run_id" <<'PY'
+import json
+import sys
+
+print(json.dumps({
+    "kernel_version_id": sys.argv[1],
+    "kernel_run_id": sys.argv[2],
+}))
+PY
+}
+
+request_notebook_score() {
+  local candidate_id="$1"
+  local kernel_version_id="$2"
+  local kernel_run_id="$3"
+  local cv_score="$4"
+
+  CANDIDATE_ID="$candidate_id" \
+  COMPETITION_SLUG="$COMPETITION_SLUG" \
+  KERNEL_REF="$KERNEL_REF" \
+  KERNEL_VERSION_ID="$kernel_version_id" \
+  KERNEL_RUN_ID="$kernel_run_id" \
+  CV_SCORE="$cv_score" \
+  bash -lc "$KAGGLE_NOTEBOOK_SCORE_CMD" || die "Notebook score request failed. Override KAGGLE_NOTEBOOK_SCORE_CMD if this competition needs a different Kaggle-native scoring call."
+}
+
+extract_score_request_payload() {
+  local raw_payload="$1"
+  python3 - "$raw_payload" <<'PY'
+import json
+import re
+import sys
+
+text = sys.argv[1].strip()
+payload = {}
+try:
+    parsed = json.loads(text)
+    if isinstance(parsed, dict):
+        payload = parsed
+except Exception:
+    payload = {}
+
+score_request_id = payload.get("score_request_id") or payload.get("request_id") or ""
+submission_id = payload.get("submission_id") or payload.get("id") or ""
+
+if not score_request_id:
+    match = re.search(r"(req-[A-Za-z0-9._-]+)", text)
+    if match:
+        score_request_id = match.group(1)
+if not submission_id:
+    match = re.search(r"(sub-[A-Za-z0-9._-]+)", text)
+    if match:
+        submission_id = match.group(1)
+
+print(json.dumps({
+    "score_request_id": score_request_id,
+    "submission_id": submission_id,
+}))
 PY
 }
 
@@ -787,29 +1144,85 @@ queue_path.write_text("\n".join(kept) + ("\n" if kept else ""))
 PY
 }
 
-extract_latest_submission_id() {
-  local submissions_csv="$1"
-  python3 - "$submissions_csv" <<'PY'
-import csv
+select_active_score_candidate() {
+  python3 - "$CANDIDATES_DIR" <<'PY'
+import json
 import sys
 from pathlib import Path
 
-path = Path(sys.argv[1])
-if not path.exists():
-    print("")
+candidate_root = Path(sys.argv[1])
+pending_states = {
+    "notebook_run_submitted",
+    "notebook_run_running",
+    "notebook_run_complete",
+    "score_request_submitted",
+    "score_pending",
+}
+best = None
+for manifest_path in candidate_root.glob("*/manifest.json"):
+    try:
+        payload = json.loads(manifest_path.read_text())
+    except Exception:
+        continue
+    if payload.get("score_state") not in pending_states:
+        continue
+    if best is None or int(payload.get("updated_at", 0)) > int(best.get("updated_at", 0)):
+        best = payload
+
+print(best.get("candidate_id", "") if best else "")
+PY
+}
+
+list_pending_score_candidates() {
+  python3 - "$CANDIDATES_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+candidate_root = Path(sys.argv[1])
+pending_states = {
+    "pending_submission",
+    "notebook_run_submitted",
+    "notebook_run_running",
+    "notebook_run_complete",
+    "score_request_submitted",
+    "score_pending",
+}
+items = []
+for manifest_path in candidate_root.glob("*/manifest.json"):
+    try:
+        payload = json.loads(manifest_path.read_text())
+    except Exception:
+        continue
+    if payload.get("score_state") not in pending_states:
+        continue
+    items.append((int(payload.get("updated_at", 0)), payload.get("candidate_id", "")))
+
+items.sort(reverse=True)
+for _, candidate_id in items:
+    if candidate_id:
+        print(candidate_id)
+PY
+}
+
+candidate_pending_timed_out() {
+  local candidate_id="$1"
+  python3 - "$(candidate_manifest_path "$candidate_id")" "$KAGGLE_PENDING_TIMEOUT_MINUTES" <<'PY'
+import json
+import sys
+import time
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+timeout_minutes = int(float(sys.argv[2]))
+if not manifest_path.exists():
+    print("0")
     raise SystemExit(0)
 
-rows = list(csv.DictReader(path.open(newline="")))
-if not rows:
-    print("")
-    raise SystemExit(0)
-
-id_key = next((key for key in rows[0].keys() if "id" in key.lower()), None)
-if not id_key:
-    print("")
-    raise SystemExit(0)
-
-print(rows[0].get(id_key, ""))
+payload = json.loads(manifest_path.read_text())
+anchor = payload.get("score_requested_at") or payload.get("updated_at") or payload.get("created_at") or 0
+timed_out = bool(anchor) and (time.time() - float(anchor) >= timeout_minutes * 60)
+print("1" if timed_out else "0")
 PY
 }
 
@@ -830,27 +1243,34 @@ handle_submission_budget_pause() {
   last_submission_id="$(read_state_value "last_submission_id" "")"
 
   if [[ -n "$candidate_id" ]]; then
+    clear_manifest_overrides
     write_candidate_manifest "$candidate_id" "quota_exhausted" "" "$cv_score" "$last_public_metrics_timestamp" "$last_submission_id"
     queue_pending_candidate "$candidate_id" "$CURRENT_SUBMISSION_COUNT"
   fi
   persist_state "$public_rank" "$public_score" "$CURRENT_SUBMISSION_COUNT" "$last_submission_path" "$last_public_metrics_timestamp" "$last_submission_id" "$candidate_id"
 
-  echo "INFO submission_budget_reached=1"
-  echo "INFO submission_window=closed"
-  echo "INFO submission_count=${CURRENT_SUBMISSION_COUNT}/${MAX_DAILY_SUBMISSIONS}"
-  echo "INFO continue_mode=local_only"
-  echo "INFO queued_candidate=${candidate_id:-none}"
-  echo "INFO queue_file=${PENDING_SUBMISSION_QUEUE}"
+  info "submission_budget_reached=1"
+  info "submission_window=closed"
+  info "submission_count=${CURRENT_SUBMISSION_COUNT}/${MAX_DAILY_SUBMISSIONS}"
+  info "continue_mode=local_only"
+  info "queued_candidate=${candidate_id:-none}"
+  info "queue_file=${PENDING_SUBMISSION_QUEUE}"
 
   emit_local_metrics "$CURRENT_SUBMISSION_COUNT"
 }
 
-finalize_submission_result() {
+submit_to_competition() {
+  local submission_path="$1"
+  local cv_score="$2"
+  local message="autoresearch $(date +%Y-%m-%dT%H:%M:%S) cv=${cv_score}"
+  kaggle competitions submit "$COMPETITION_SLUG" -f "$submission_path" -m "$message"
+}
+
+finalize_public_score() {
   local candidate_id="$1"
   local submission_path="$2"
   local cv_score="$3"
-
-  sleep "$POST_SUBMIT_SLEEP_SECONDS"
+  local submission_id="$4"
 
   local submissions_csv="outputs/submissions-after.csv"
   fetch_submissions_csv "$submissions_csv"
@@ -863,90 +1283,413 @@ finalize_submission_result() {
   local public_rank
   local public_score
   local submission_count
-  local submission_id
   local public_metrics_timestamp
   public_rank="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["public_rank"])' <<<"$public_metrics")"
   public_score="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["public_score"])' <<<"$public_metrics")"
   submission_count="$(count_recent_submissions "$submissions_csv")"
-  submission_id="$(extract_latest_submission_id "$submissions_csv")"
   public_metrics_timestamp="$(date +%s)"
 
   persist_state "$public_rank" "$public_score" "$submission_count" "$submission_path" "$public_metrics_timestamp" "$submission_id" "$candidate_id"
+  clear_manifest_overrides
+  export MANIFEST_SOURCE_SUBMISSION_FILE="$submission_path"
   write_candidate_manifest "$candidate_id" "public_scored" "" "$cv_score" "$public_metrics_timestamp" "$submission_id"
+  clear_manifest_overrides
   remove_queued_candidate "$candidate_id"
 
   emit_metric "public_rank" "$public_rank"
   emit_metric "public_score" "$public_score"
   emit_metric "cv_score" "$cv_score"
   emit_metric "submission_count" "$submission_count"
-  echo "INFO candidate_id=${candidate_id}"
-  echo "INFO submission_id=${submission_id}"
+  info "candidate_id=${candidate_id}"
+  info "submission_id=${submission_id}"
+}
+
+start_file_score_pipeline() {
+  local candidate_id="$1"
+  local submission_path="$2"
+  local cv_score="$3"
+
+  local submit_output
+  submit_output="$(submit_to_competition "$submission_path" "$cv_score")"
+  local submission_id
+  submission_id="$(extract_submission_id_from_output "$submit_output")"
+
+  clear_manifest_overrides
+  export MANIFEST_SOURCE_SUBMISSION_FILE="$submission_path"
+  export MANIFEST_SUBMISSION_ARTIFACT_KIND="file"
+  write_candidate_manifest "$candidate_id" "score_request_submitted" "refresh_public_score" "$cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" "$submission_id"
+  clear_manifest_overrides
+  remove_queued_candidate "$candidate_id"
+
+  info "candidate_id=${candidate_id}"
+  info "submission_id=${submission_id:-pending}"
+  info "score_state=score_request_submitted"
+  emit_local_metrics "$((CURRENT_SUBMISSION_COUNT + 1))"
+}
+
+start_notebook_pipeline() {
+  local candidate_id="$1"
+  local cv_score="$2"
+  local stage_dir
+  stage_dir="$(stage_candidate_kernel_dir "$candidate_id")"
+
+  local push_output
+  if [[ -n "$KAGGLE_NOTEBOOK_PUSH_CMD" ]]; then
+    push_output="$(ROOT_DIR="$ROOT_DIR" COMPETITION_SLUG="$COMPETITION_SLUG" KERNEL_REF="$KERNEL_REF" CANDIDATE_ID="$candidate_id" KAGGLE_STAGE_DIR="$stage_dir" bash -lc "$KAGGLE_NOTEBOOK_PUSH_CMD" 2>&1)"
+  else
+    push_output="$(kaggle kernels push -p "$stage_dir" 2>&1)"
+  fi
+
+  local identity_json
+  identity_json="$(resolve_kernel_identity_after_push "$push_output")"
+  local kernel_version_id
+  local kernel_run_id
+  kernel_version_id="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("kernel_version_id",""))' <<<"$identity_json")"
+  kernel_run_id="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("kernel_run_id",""))' <<<"$identity_json")"
+
+  [[ -n "$kernel_version_id" ]] || die "Unable to determine the pushed notebook version ID. Configure KAGGLE_NOTEBOOK_IDENTITY_CMD if the CLI output does not expose it."
+
+  clear_manifest_overrides
+  export MANIFEST_KERNEL_VERSION_ID="$kernel_version_id"
+  export MANIFEST_KERNEL_RUN_ID="$kernel_run_id"
+  export MANIFEST_SUBMISSION_ARTIFACT_KIND="$([[ "$COMPETITION_MODE" == "notebook_scored" ]] && printf 'notebook_version' || printf 'file')"
+  write_candidate_manifest "$candidate_id" "notebook_run_submitted" "refresh_notebook_run" "$cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" "$(read_state_value "last_submission_id" "")"
+  clear_manifest_overrides
+  remove_queued_candidate "$candidate_id"
+
+  info "candidate_id=${candidate_id}"
+  info "kernel_version_id=${kernel_version_id}"
+  info "kernel_run_id=${kernel_run_id:-pending}"
+  info "score_state=notebook_run_submitted"
+  emit_local_metrics
+}
+
+request_notebook_score_for_candidate() {
+  local candidate_id="$1"
+  local cv_score="$2"
+  local kernel_version_id
+  local kernel_run_id
+  kernel_version_id="$(candidate_manifest_value "$candidate_id" "kernel_version_id" "")"
+  kernel_run_id="$(candidate_manifest_value "$candidate_id" "kernel_run_id" "")"
+  [[ -n "$kernel_version_id" ]] || die "Cannot request notebook score without kernel_version_id for ${candidate_id}."
+
+  local request_output
+  request_output="$(request_notebook_score "$candidate_id" "$kernel_version_id" "$kernel_run_id" "$cv_score")"
+  local request_json
+  request_json="$(extract_score_request_payload "$request_output")"
+  local score_request_id
+  local submission_id
+  score_request_id="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("score_request_id",""))' <<<"$request_json")"
+  submission_id="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("submission_id",""))' <<<"$request_json")"
+
+  clear_manifest_overrides
+  export MANIFEST_SCORE_REQUEST_ID="$score_request_id"
+  export MANIFEST_SCORE_REQUESTED_AT="$(date +%s)"
+  export MANIFEST_SUBMISSION_ARTIFACT_KIND="notebook_version"
+  write_candidate_manifest "$candidate_id" "score_request_submitted" "refresh_public_score" "$cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" "$submission_id"
+  clear_manifest_overrides
+
+  info "candidate_id=${candidate_id}"
+  info "score_request_id=${score_request_id:-pending}"
+  info "submission_id=${submission_id:-pending}"
+  info "score_state=score_request_submitted"
+  emit_local_metrics "$((CURRENT_SUBMISSION_COUNT + 1))"
+}
+
+refresh_public_score_for_candidate() {
+  local candidate_id="$1"
+  local cv_score="$2"
+  local submission_path
+  local submissions_csv
+  local target_submission_id
+  local record_json
+  local resolved_submission_id
+  local scored
+
+  submission_path="$(candidate_submission_file "$candidate_id")"
+  submissions_csv="outputs/submissions-after.csv"
+  fetch_submissions_csv "$submissions_csv"
+  target_submission_id="$(candidate_manifest_value "$candidate_id" "submission_id" "")"
+  record_json="$(extract_submission_record "$submissions_csv" "$target_submission_id")"
+  resolved_submission_id="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("submission_id",""))' <<<"$record_json")"
+  scored="$(python3 -c 'import json,sys; print("1" if json.loads(sys.stdin.read()).get("scored") else "0")' <<<"$record_json")"
+
+  if [[ "$scored" == "1" ]]; then
+    finalize_public_score "$candidate_id" "$submission_path" "$cv_score" "$resolved_submission_id"
+    return 0
+  fi
+
+  clear_manifest_overrides
+  if [[ -n "$resolved_submission_id" ]]; then
+    write_candidate_manifest "$candidate_id" "score_pending" "refresh_public_score" "$cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" "$resolved_submission_id"
+  else
+    write_candidate_manifest "$candidate_id" "score_request_submitted" "refresh_public_score" "$cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" ""
+  fi
+  clear_manifest_overrides
+
+  info "candidate_id=${candidate_id}"
+  info "submission_id=${resolved_submission_id:-pending}"
+  info "score_state=$([[ -n "$resolved_submission_id" ]] && printf 'score_pending' || printf 'score_request_submitted')"
+  emit_local_metrics
+}
+
+refresh_notebook_candidate() {
+  local candidate_id="$1"
+  local cv_score="$2"
+
+  if [[ "$(candidate_pending_timed_out "$candidate_id")" == "1" ]]; then
+    clear_manifest_overrides
+    write_candidate_manifest "$candidate_id" "score_failed" "" "$cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" "$(candidate_manifest_value "$candidate_id" "submission_id" "")"
+    clear_manifest_overrides
+    info "candidate_id=${candidate_id}"
+    info "score_state=score_failed"
+    emit_local_metrics
+    return 0
+  fi
+
+  local status_json
+  status_json="$(fetch_kernel_status_once)"
+  local kernel_status
+  local kernel_version_id
+  local kernel_run_id
+  kernel_status="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("status","unknown"))' <<<"$status_json")"
+  kernel_version_id="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("kernel_version_id",""))' <<<"$status_json")"
+  kernel_run_id="$(python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("kernel_run_id",""))' <<<"$status_json")"
+
+  case "$kernel_status" in
+    complete)
+      clear_manifest_overrides
+      export MANIFEST_KERNEL_VERSION_ID="${kernel_version_id:-$(candidate_manifest_value "$candidate_id" "kernel_version_id" "")}"
+      export MANIFEST_KERNEL_RUN_ID="${kernel_run_id:-$(candidate_manifest_value "$candidate_id" "kernel_run_id" "")}"
+      write_candidate_manifest "$candidate_id" "notebook_run_complete" "$([[ "$COMPETITION_MODE" == "notebook_scored" ]] && printf 'request_score' || printf 'submit_file')" "$cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" "$(candidate_manifest_value "$candidate_id" "submission_id" "")"
+      clear_manifest_overrides
+
+      if [[ "$COMPETITION_MODE" == "notebook_scored" ]]; then
+        if submission_budget_reached; then
+          info "candidate_id=${candidate_id}"
+          info "score_state=notebook_run_complete"
+          info "pending_next_action=request_score"
+          emit_local_metrics "$CURRENT_SUBMISSION_COUNT"
+          return 0
+        fi
+        request_notebook_score_for_candidate "$candidate_id" "$cv_score"
+      else
+        if submission_budget_reached; then
+          info "candidate_id=${candidate_id}"
+          info "score_state=notebook_run_complete"
+          info "pending_next_action=submit_file"
+          emit_local_metrics "$CURRENT_SUBMISSION_COUNT"
+          return 0
+        fi
+        local kernel_submission
+        kernel_submission="$(download_kernel_output)"
+        start_file_score_pipeline "$candidate_id" "$kernel_submission" "$cv_score"
+      fi
+      ;;
+    failed)
+      clear_manifest_overrides
+      export MANIFEST_KERNEL_VERSION_ID="${kernel_version_id:-$(candidate_manifest_value "$candidate_id" "kernel_version_id" "")}"
+      export MANIFEST_KERNEL_RUN_ID="${kernel_run_id:-$(candidate_manifest_value "$candidate_id" "kernel_run_id" "")}"
+      write_candidate_manifest "$candidate_id" "score_failed" "" "$cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" "$(candidate_manifest_value "$candidate_id" "submission_id" "")"
+      clear_manifest_overrides
+      info "candidate_id=${candidate_id}"
+      info "score_state=score_failed"
+      emit_local_metrics
+      ;;
+    *)
+      clear_manifest_overrides
+      export MANIFEST_KERNEL_VERSION_ID="${kernel_version_id:-$(candidate_manifest_value "$candidate_id" "kernel_version_id" "")}"
+      export MANIFEST_KERNEL_RUN_ID="${kernel_run_id:-$(candidate_manifest_value "$candidate_id" "kernel_run_id" "")}"
+      write_candidate_manifest "$candidate_id" "notebook_run_running" "refresh_notebook_run" "$cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" "$(candidate_manifest_value "$candidate_id" "submission_id" "")"
+      clear_manifest_overrides
+      info "candidate_id=${candidate_id}"
+      info "score_state=notebook_run_running"
+      emit_local_metrics
+      ;;
+  esac
+}
+
+refresh_candidate_score() {
+  local candidate_id="$1"
+  local score_state
+  local cv_score
+  score_state="$(candidate_manifest_value "$candidate_id" "score_state" "unknown")"
+  cv_score="$(candidate_metric_value "$candidate_id" "cv_score" "$(read_metrics_value "cv_score" "0")")"
+
+  case "$score_state" in
+    pending_submission)
+      if submission_budget_reached; then
+        info "candidate_id=${candidate_id}"
+        info "score_state=pending_submission"
+        emit_local_metrics "$CURRENT_SUBMISSION_COUNT"
+        return 0
+      fi
+      if [[ "$COMPETITION_MODE" == "file_upload" ]]; then
+        start_file_score_pipeline "$candidate_id" "$(candidate_submission_file "$candidate_id")" "$cv_score"
+      else
+        start_notebook_pipeline "$candidate_id" "$cv_score"
+      fi
+      ;;
+    notebook_run_submitted|notebook_run_running)
+      refresh_notebook_candidate "$candidate_id" "$cv_score"
+      ;;
+    notebook_run_complete)
+      if [[ "$COMPETITION_MODE" == "notebook_scored" ]]; then
+        if submission_budget_reached; then
+          info "candidate_id=${candidate_id}"
+          info "score_state=notebook_run_complete"
+          info "pending_next_action=request_score"
+          emit_local_metrics "$CURRENT_SUBMISSION_COUNT"
+          return 0
+        fi
+        request_notebook_score_for_candidate "$candidate_id" "$cv_score"
+      else
+        if submission_budget_reached; then
+          info "candidate_id=${candidate_id}"
+          info "score_state=notebook_run_complete"
+          info "pending_next_action=submit_file"
+          emit_local_metrics "$CURRENT_SUBMISSION_COUNT"
+          return 0
+        fi
+        local kernel_submission
+        kernel_submission="$(download_kernel_output)"
+        start_file_score_pipeline "$candidate_id" "$kernel_submission" "$cv_score"
+      fi
+      ;;
+    score_request_submitted|score_pending)
+      refresh_public_score_for_candidate "$candidate_id" "$cv_score"
+      ;;
+    score_failed|public_scored|local_only|quota_exhausted|unknown)
+      info "candidate_id=${candidate_id}"
+      info "score_state=${score_state}"
+      emit_local_metrics
+      ;;
+    *)
+      die "Unsupported candidate score_state=${score_state} for ${candidate_id}"
+      ;;
+  esac
 }
 
 local_only_mode() {
   local candidate_id="$1"
-  run_local_pipeline
+  run_local_pipeline >&2
   local cv_score
   cv_score="$(read_metrics_value "cv_score" "0")"
+  clear_manifest_overrides
+  export MANIFEST_SUBMISSION_ARTIFACT_KIND="file"
   write_candidate_manifest "$candidate_id" "local_only" "" "$cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" "$(read_state_value "last_submission_id" "")"
-  echo "INFO candidate_id=${candidate_id}"
+  clear_manifest_overrides
+  info "candidate_id=${candidate_id}"
   emit_local_metrics
 }
 
-submit_stored_candidate() {
-  local candidate_id="$1"
-  local submission_path
-  local cv_score
-  submission_path="$(candidate_submission_file "$candidate_id")"
-  [[ -f "$submission_path" ]] || die "Stored candidate artifact missing for ${candidate_id}: ${submission_path}"
-  cv_score="$(candidate_metric_value "$candidate_id" "cv_score" "0")"
-  submit_to_competition "$submission_path" "$cv_score"
-  finalize_submission_result "$candidate_id" "$submission_path" "$cv_score"
-}
+prepare_submission_candidate() {
+  local requested_candidate_id="$1"
+  local candidate_id="$requested_candidate_id"
 
-submit_mode() {
-  local candidate_id="${1:-}"
-  require_cmd kaggle
-  require_kaggle_auth
-  verify_competition_access
-  if submission_budget_reached; then
-    if [[ -z "$candidate_id" ]]; then
-      candidate_id="$(select_best_pending_candidate)"
-    fi
-    if [[ -z "$candidate_id" ]]; then
-      candidate_id="$(resolve_candidate_id "${CANDIDATE_ID:-}")"
-      run_local_pipeline
-      local queued_cv_score
-      queued_cv_score="$(read_metrics_value "cv_score" "0")"
-      write_candidate_manifest "$candidate_id" "quota_exhausted" "" "$queued_cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" "$(read_state_value "last_submission_id" "")"
-    fi
-    handle_submission_budget_pause "$candidate_id"
+  if [[ -n "$candidate_id" && -f "$(candidate_manifest_path "$candidate_id")" ]]; then
+    printf '%s\n' "$candidate_id"
     return 0
   fi
 
   if [[ -z "$candidate_id" ]]; then
     candidate_id="$(select_best_pending_candidate)"
+    if [[ -n "$candidate_id" && -f "$(candidate_manifest_path "$candidate_id")" ]]; then
+      printf '%s\n' "$candidate_id"
+      return 0
+    fi
   fi
 
-  if [[ -n "$candidate_id" ]]; then
-    submit_stored_candidate "$candidate_id"
+  candidate_id="$(resolve_candidate_id "${requested_candidate_id:-${CANDIDATE_ID:-}}")"
+  run_local_pipeline >&2
+  local cv_score
+  cv_score="$(read_metrics_value "cv_score" "0")"
+  clear_manifest_overrides
+  export MANIFEST_SUBMISSION_ARTIFACT_KIND="file"
+  write_candidate_manifest "$candidate_id" "pending_submission" "submit_candidate" "$cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" "$(read_state_value "last_submission_id" "")"
+  clear_manifest_overrides
+  printf '%s\n' "$candidate_id"
+}
+
+submit_mode() {
+  local requested_candidate_id="${1:-}"
+  require_cmd kaggle
+  require_kaggle_auth
+  verify_competition_access
+
+  local active_candidate_id
+  active_candidate_id="$(select_active_score_candidate)"
+  if [[ -n "$active_candidate_id" && ( -z "$requested_candidate_id" || "$requested_candidate_id" == "$active_candidate_id" ) ]]; then
+    refresh_candidate_score "$active_candidate_id"
     return 0
   fi
 
-  candidate_id="$(resolve_candidate_id "${CANDIDATE_ID:-}")"
-  run_local_pipeline
+  if submission_budget_reached; then
+    local queued_candidate_id="$requested_candidate_id"
+    if [[ -z "$queued_candidate_id" ]]; then
+      queued_candidate_id="$(select_best_pending_candidate)"
+    fi
+    if [[ -z "$queued_candidate_id" || ! -f "$(candidate_manifest_path "$queued_candidate_id")" ]]; then
+      queued_candidate_id="$(resolve_candidate_id "${requested_candidate_id:-${CANDIDATE_ID:-}}")"
+      run_local_pipeline
+      local queued_cv_score
+      queued_cv_score="$(read_metrics_value "cv_score" "0")"
+      clear_manifest_overrides
+      export MANIFEST_SUBMISSION_ARTIFACT_KIND="file"
+      write_candidate_manifest "$queued_candidate_id" "quota_exhausted" "" "$queued_cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" "$(read_state_value "last_submission_id" "")"
+      clear_manifest_overrides
+    fi
+    handle_submission_budget_pause "$queued_candidate_id"
+    return 0
+  fi
+
+  local candidate_id
+  candidate_id="$(prepare_submission_candidate "$requested_candidate_id")"
   local cv_score
-  cv_score="$(read_metrics_value "cv_score" "0")"
-  write_candidate_manifest "$candidate_id" "pending_submission" "" "$cv_score" "$(read_state_value "last_public_metrics_timestamp" "0")" "$(read_state_value "last_submission_id" "")"
+  cv_score="$(candidate_metric_value "$candidate_id" "cv_score" "$(read_metrics_value "cv_score" "0")")"
 
-  kaggle kernels push -p "$ROOT_DIR"
-  wait_for_kernel
+  case "$COMPETITION_MODE" in
+    file_upload)
+      start_file_score_pipeline "$candidate_id" "$(candidate_submission_file "$candidate_id")" "$cv_score"
+      ;;
+    notebook_scored|hybrid)
+      start_notebook_pipeline "$candidate_id" "$cv_score"
+      ;;
+    *)
+      die "Unsupported COMPETITION_MODE=${COMPETITION_MODE}"
+      ;;
+  esac
+}
 
-  local kernel_submission
-  kernel_submission="$(download_kernel_output)"
+refresh_score_mode() {
+  local target="${1:-}"
+  require_cmd kaggle
+  require_kaggle_auth
+  verify_competition_access
 
-  submit_to_competition "$kernel_submission" "$cv_score"
-  finalize_submission_result "$candidate_id" "$kernel_submission" "$cv_score"
+  local targets=()
+  if [[ "$target" == "--all-pending" ]]; then
+    mapfile -t targets < <(list_pending_score_candidates)
+  elif [[ -n "$target" ]]; then
+    targets=("$(normalize_candidate_id "$target")")
+  else
+    local active_candidate_id
+    active_candidate_id="$(select_active_score_candidate)"
+    if [[ -n "$active_candidate_id" ]]; then
+      targets=("$active_candidate_id")
+    fi
+  fi
+
+  if [[ ${#targets[@]} -eq 0 ]]; then
+    info "no_pending_score_work=1"
+    emit_local_metrics
+    return 0
+  fi
+
+  local candidate_id
+  for candidate_id in "${targets[@]}"; do
+    refresh_candidate_score "$candidate_id"
+  done
 }
 
 merge_candidates_mode() {
@@ -957,7 +1700,6 @@ merge_candidates_mode() {
   python3 - "$CANDIDATES_DIR" "$merge_inputs" "$SUBMISSION_FILE" "$METRICS_FILE" "$CV_DIRECTION" <<'PY'
 import csv
 import json
-import math
 import shutil
 import sys
 from pathlib import Path
@@ -1040,31 +1782,39 @@ metrics_path.parent.mkdir(parents=True, exist_ok=True)
 metrics_path.write_text(json.dumps(metrics, indent=2) + "\n")
 PY
 
-  write_candidate_manifest "$candidate_id" "local_only" "$merge_inputs" "$(read_metrics_value "cv_score" "0")" "$(read_state_value "last_public_metrics_timestamp" "0")" "$(read_state_value "last_submission_id" "")"
-  echo "INFO merged_candidate_id=${candidate_id}"
+  clear_manifest_overrides
+  export MANIFEST_SOURCE_SUBMISSION_FILE="$SUBMISSION_FILE"
+  export MANIFEST_SUBMISSION_ARTIFACT_KIND="file"
+  write_candidate_manifest "$candidate_id" "local_only" "" "$(read_metrics_value "cv_score" "0")" "$(read_state_value "last_public_metrics_timestamp" "0")" "$(read_state_value "last_submission_id" "")" "$merge_inputs"
+  clear_manifest_overrides
+  info "merged_candidate_id=${candidate_id}"
   emit_local_metrics
 }
 
 load_env_file_if_present
 resolve_leaderboard_team_name
 ensure_state_file
+normalize_competition_mode
 
 case "$MODE" in
   --local-only)
     local_only_mode "$(resolve_candidate_id "${MODE_ARG:-${CANDIDATE_ID:-}}")"
     ;;
   --submit)
-    submit_mode ""
+    submit_mode "${MODE_ARG:-}"
     ;;
   --submit-candidate)
     [[ -n "$MODE_ARG" ]] || die "--submit-candidate requires a candidate ID."
     submit_mode "$(normalize_candidate_id "$MODE_ARG")"
+    ;;
+  --refresh-score)
+    refresh_score_mode "${MODE_ARG:-}"
     ;;
   --merge-candidates)
     [[ -n "$MODE_ARG" ]] || die "--merge-candidates requires a comma-separated candidate ID list."
     merge_candidates_mode "$MODE_ARG"
     ;;
   *)
-    die "Unsupported mode: $MODE. Use --local-only, --submit, --submit-candidate, or --merge-candidates."
+    die "Unsupported mode: $MODE. Use --local-only, --submit, --submit-candidate, --refresh-score, or --merge-candidates."
     ;;
 esac

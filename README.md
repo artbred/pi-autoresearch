@@ -302,6 +302,8 @@ python3 -m pip install --user kaggle
 
 Use the CLI directly for auth, pushes, status checks, output download, and submissions. Do not replace the submission flow with project-local Python packages or wrappers.
 
+For notebook-scored competitions, the generated template now defaults the second score-request step to `kaggle notebook-score`. Override `KAGGLE_NOTEBOOK_SCORE_CMD` only if a competition needs a different Kaggle-native scoring call.
+
 Preferred auth is environment-backed. The generated script loads `${KAGGLE_ENV_FILE:-.env}` automatically.
 
 Supported credential patterns:

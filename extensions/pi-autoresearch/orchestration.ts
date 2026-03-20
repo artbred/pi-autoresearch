@@ -6,6 +6,9 @@ export type ActionType =
   | "baseline"
   | "local_only"
   | "submit"
+  | "submit_notebook"
+  | "request_score"
+  | "refresh_score"
   | "merge"
   | "promote"
   | "refresh";
@@ -13,6 +16,12 @@ export type ScoreState =
   | "unknown"
   | "local_only"
   | "pending_submission"
+  | "notebook_run_submitted"
+  | "notebook_run_running"
+  | "notebook_run_complete"
+  | "score_request_submitted"
+  | "score_pending"
+  | "score_failed"
   | "public_scored"
   | "provisional"
   | "quota_exhausted";
@@ -123,7 +132,13 @@ export interface CandidateRecord {
   metric: number;
   metrics: Record<string, number>;
   description: string;
-  status: "ready" | "pending_submission" | "public_scored" | "merged" | "discarded";
+  status:
+    | "ready"
+    | "pending_submission"
+    | "pending_score"
+    | "public_scored"
+    | "merged"
+    | "discarded";
   scoreState: ScoreState;
   provisional: boolean;
   createdAt: number;
@@ -155,6 +170,7 @@ export interface OrchestratorState {
   lanes: Record<string, LaneState>;
   candidates: Record<string, CandidateRecord>;
   pendingSubmissionQueue: string[];
+  activeScoreCandidateId: string | null;
   updatedAt: number;
 }
 
@@ -444,6 +460,7 @@ export function createOrchestratorState(args: {
   existing?: Partial<OrchestratorState> | null;
 }): OrchestratorState {
   const existing = args.existing ?? {};
+  const candidates = normalizeCandidates(existing.candidates);
   const lanes = normalizeLanes(
     existing.lanes,
     args.worktreeRoot,
@@ -477,10 +494,14 @@ export function createOrchestratorState(args: {
       quotaBlocked: !!existing.policy?.quotaBlocked,
     },
     lanes,
-    candidates: normalizeCandidates(existing.candidates),
+    candidates,
     pendingSubmissionQueue: Array.isArray(existing.pendingSubmissionQueue)
       ? existing.pendingSubmissionQueue.filter((entry): entry is string => typeof entry === "string")
       : [],
+    activeScoreCandidateId:
+      typeof existing.activeScoreCandidateId === "string"
+        ? existing.activeScoreCandidateId
+        : resolveActiveScoreCandidateId(candidates),
     updatedAt:
       typeof existing.updatedAt === "number" ? existing.updatedAt : Date.now(),
   };
@@ -544,7 +565,10 @@ export function applyExperimentToOrchestrator(
     if (input.status === "keep") {
       lane.consecutiveNonImprovingRuns = 0;
       lane.lastKeepAt = timestamp;
-      lane.status = input.candidateId ? "ready" : idleStatus(orchestrator);
+      lane.status =
+        input.candidateId && isQueueEligibleScoreState(scoreState)
+          ? "ready"
+          : idleStatus(orchestrator);
       lane.yieldReason = null;
     } else {
       lane.consecutiveNonImprovingRuns += 1;
@@ -572,7 +596,7 @@ export function applyExperimentToOrchestrator(
     orchestrator.policy.quotaBlocked = false;
   }
 
-  if (scoreState === "public_scored" || actionType === "refresh") {
+  if (scoreState === "public_scored") {
     orchestrator.policy.lastFreshPublicScoreAt =
       input.publicMetricsTimestamp ?? timestamp;
     orchestrator.policy.localKeepsWithoutScore = 0;
@@ -613,10 +637,19 @@ export function applyExperimentToOrchestrator(
       ]),
     };
     orchestrator.candidates[input.candidateId] = next;
+    if (isPendingScoreState(scoreState)) {
+      orchestrator.activeScoreCandidateId = next.candidateId;
+    } else if (orchestrator.activeScoreCandidateId === next.candidateId) {
+      orchestrator.activeScoreCandidateId = null;
+    }
     updatePendingQueue(orchestrator, next);
     if (lane) {
       lane.currentCandidateId = next.candidateId;
-      if (next.status === "ready" || next.status === "pending_submission" || next.status === "merged") {
+      if (
+        next.status === "ready" ||
+        next.status === "pending_submission" ||
+        next.status === "merged"
+      ) {
         lane.readyCandidateIds = dedupeStrings([
           ...lane.readyCandidateIds,
           next.candidateId,
@@ -674,6 +707,8 @@ export function looksLikeSubmissionCommand(command: string): boolean {
     normalized.includes("--submit") ||
     normalized.includes("submit-candidate") ||
     normalized.includes("competitions submit") ||
+    normalized.includes("submit_notebook") ||
+    normalized.includes("request-score") ||
     normalized.includes("leaderboard") ||
     normalized.includes("score refresh") ||
     normalized.includes("refresh-score")
@@ -765,6 +800,7 @@ function normalizeCandidates(
       status:
         value.status === "discarded" ||
         value.status === "pending_submission" ||
+        value.status === "pending_score" ||
         value.status === "public_scored" ||
         value.status === "merged"
           ? value.status
@@ -787,6 +823,19 @@ function normalizeCandidates(
     };
   }
   return normalized;
+}
+
+function resolveActiveScoreCandidateId(
+  candidates: Record<string, CandidateRecord>
+): string | null {
+  let newest: CandidateRecord | null = null;
+  for (const candidate of Object.values(candidates)) {
+    if (!isPendingScoreState(candidate.scoreState)) continue;
+    if (!newest || candidate.updatedAt > newest.updatedAt) {
+      newest = candidate;
+    }
+  }
+  return newest?.candidateId ?? null;
 }
 
 function updatePendingQueue(
@@ -814,6 +863,7 @@ function refreshForcedSubmitPolicy(
   timestamp: number
 ): void {
   const hasQueuedCandidate = orchestrator.pendingSubmissionQueue.length > 0;
+  const hasScoreInFlight = orchestrator.activeScoreCandidateId !== null;
   const thresholdExceeded =
     orchestrator.policy.localKeepsWithoutScore >=
     orchestrator.policy.maxLocalKeepsWithoutScore;
@@ -824,6 +874,7 @@ function refreshForcedSubmitPolicy(
 
   if (
     !orchestrator.policy.quotaBlocked &&
+    !hasScoreInFlight &&
     hasQueuedCandidate &&
     (thresholdExceeded || timeExceeded)
   ) {
@@ -849,6 +900,7 @@ function resolveCandidateStatus(
   if (experimentStatus !== "keep") return "discarded";
   if (scoreState === "public_scored") return "public_scored";
   if (scoreState === "quota_exhausted") return "pending_submission";
+  if (isPendingScoreState(scoreState)) return "pending_score";
   if (actionType === "merge") return "merged";
   return "ready";
 }
@@ -868,6 +920,20 @@ function isLocalOnlyScoreState(scoreState: ScoreState): boolean {
     scoreState === "provisional" ||
     scoreState === "quota_exhausted"
   );
+}
+
+function isPendingScoreState(scoreState: ScoreState): boolean {
+  return (
+    scoreState === "notebook_run_submitted" ||
+    scoreState === "notebook_run_running" ||
+    scoreState === "notebook_run_complete" ||
+    scoreState === "score_request_submitted" ||
+    scoreState === "score_pending"
+  );
+}
+
+function isQueueEligibleScoreState(scoreState: ScoreState): boolean {
+  return !isPendingScoreState(scoreState) && scoreState !== "score_failed";
 }
 
 function isLaneStatus(value: unknown): value is LaneStatus {
@@ -896,6 +962,9 @@ function isActionType(value: unknown): value is ActionType {
     value === "baseline" ||
     value === "local_only" ||
     value === "submit" ||
+    value === "submit_notebook" ||
+    value === "request_score" ||
+    value === "refresh_score" ||
     value === "merge" ||
     value === "promote" ||
     value === "refresh"
@@ -907,6 +976,12 @@ function isScoreState(value: unknown): value is ScoreState {
     value === "unknown" ||
     value === "local_only" ||
     value === "pending_submission" ||
+    value === "notebook_run_submitted" ||
+    value === "notebook_run_running" ||
+    value === "notebook_run_complete" ||
+    value === "score_request_submitted" ||
+    value === "score_pending" ||
+    value === "score_failed" ||
     value === "public_scored" ||
     value === "provisional" ||
     value === "quota_exhausted"

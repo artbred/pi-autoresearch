@@ -195,6 +195,9 @@ const LogParams = Type.Object({
       "baseline",
       "local_only",
       "submit",
+      "submit_notebook",
+      "request_score",
+      "refresh_score",
       "merge",
       "promote",
       "refresh",
@@ -205,6 +208,12 @@ const LogParams = Type.Object({
       "unknown",
       "local_only",
       "pending_submission",
+      "notebook_run_submitted",
+      "notebook_run_running",
+      "notebook_run_complete",
+      "score_request_submitted",
+      "score_pending",
+      "score_failed",
       "public_scored",
       "provisional",
       "quota_exhausted",
@@ -781,9 +790,18 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     const explicit = params.score_state as ScoreState | undefined;
     if (explicit) return explicit;
     if (params.provisional === true) return "provisional";
-    if (params.action_type === "submit") return "public_scored";
-    if (params.action_type === "local_only") return "local_only";
-    return "unknown";
+    switch (params.action_type) {
+      case "submit":
+        return "pending_submission";
+      case "submit_notebook":
+        return "notebook_run_submitted";
+      case "request_score":
+        return "score_request_submitted";
+      case "local_only":
+        return "local_only";
+      default:
+        return "unknown";
+    }
   };
 
   const makeCandidateId = (
@@ -839,30 +857,58 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   }) => {
     const candidateDir = path.join(args.paths.candidatesDir, args.candidateId);
     fs.mkdirSync(candidateDir, { recursive: true });
+    const manifestPath = path.join(candidateDir, "manifest.json");
+    let existing: Record<string, unknown> = {};
+    try {
+      if (fs.existsSync(manifestPath)) {
+        const raw = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+        if (raw && typeof raw === "object") {
+          existing = raw as Record<string, unknown>;
+        }
+      }
+    } catch {
+      existing = {};
+    }
+
+    const existingArtifactPaths = Array.isArray(existing.artifact_paths)
+      ? existing.artifact_paths.filter((entry): entry is string => typeof entry === "string")
+      : [];
+    const existingLineage = Array.isArray(existing.lineage)
+      ? existing.lineage.filter((entry): entry is string => typeof entry === "string")
+      : [];
+
     const manifest = {
+      ...existing,
       candidate_id: args.candidateId,
-      lane_id: args.laneId ?? null,
-      strategy_id: args.strategyId ?? null,
+      lane_id: args.laneId ?? existing.lane_id ?? null,
+      strategy_id: args.strategyId ?? existing.strategy_id ?? null,
       commit: args.experiment.commit,
       metric: args.experiment.metric,
       metrics: args.experiment.metrics,
       status: args.experiment.status,
       description: args.experiment.description,
-      action_type: args.experiment.actionType ?? null,
-      score_state: args.experiment.scoreState ?? null,
-      provisional: args.experiment.provisional ?? false,
-      public_metrics_timestamp: args.experiment.publicMetricsTimestamp ?? null,
+      action_type: args.experiment.actionType ?? existing.action_type ?? null,
+      score_state: args.experiment.scoreState ?? existing.score_state ?? null,
+      provisional: args.experiment.provisional ?? existing.provisional ?? false,
+      public_metrics_timestamp:
+        args.experiment.publicMetricsTimestamp ??
+        existing.public_metrics_timestamp ??
+        null,
       worktree_path: args.workDir,
       artifact_dir: candidateDir,
-      artifact_paths: args.artifactPaths,
-      lineage:
-        args.experiment.candidateId && args.experiment.candidateId !== args.candidateId
-          ? [args.experiment.candidateId]
-          : [],
+      artifact_paths: [...new Set([...existingArtifactPaths, ...args.artifactPaths])],
+      lineage: [
+        ...new Set([
+          ...existingLineage,
+          ...(args.experiment.candidateId && args.experiment.candidateId !== args.candidateId
+            ? [args.experiment.candidateId]
+            : []),
+        ]),
+      ],
       updated_at: args.experiment.timestamp,
     };
     fs.writeFileSync(
-      path.join(candidateDir, "manifest.json"),
+      manifestPath,
       JSON.stringify(manifest, null, 2) + "\n"
     );
   };
@@ -1232,6 +1278,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "\nWhen parallel orchestration is enabled, use lane_ids exploit, explore, and merge. Always pass lane_id and strategy_id to run_experiment and log_experiment when you are operating inside a lane." +
       "\nCandidate-producing keeps should carry a candidate_id so the coordinator can compare, queue, and merge them." +
       "\nThe merge lane is for artifact-level merges or ensembles first. Do not auto-merge code branches." +
+      "\nKaggle score acquisition must be non-blocking: use short submit/refresh runs and keep exploring while notebook execution or scoring is pending." +
       `\n${EVALUATION_GUARDRAIL}` +
       "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration.";
 
@@ -1248,6 +1295,9 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
           .join(",");
       if (runtime.orchestrator.policy.forcedSubmitRequired) {
         extra += `\nSubmission freshness gate: ${runtime.orchestrator.policy.forcedSubmitReason ?? "A fresh public score is required now."}`;
+      }
+      if (runtime.orchestrator.activeScoreCandidateId) {
+        extra += `\nActive score pipeline: ${runtime.orchestrator.activeScoreCandidateId} — advance it with refresh actions, but keep other lanes producing new candidates in parallel.`;
       }
     }
 
@@ -1384,6 +1434,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       "Run a timed experiment command (captures duration, output, exit code)",
     promptGuidelines: [
       "Use run_experiment instead of bash when running experiment commands — it handles timing and output capture automatically.",
+      "When Kaggle score work is pending, use short reconciliation commands such as ./autoresearch.sh --submit or ./autoresearch.sh --refresh-score instead of long polling loops.",
       "After run_experiment, always call log_experiment to record the result.",
     ],
     parameters: RunParams,
